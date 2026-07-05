@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "module": "commonjs",
+    "target": "es2022",
+    "moduleResolution": "node",
+    "types": ["jest", "node"]
+  },
+  "include": ["src"]
+}
