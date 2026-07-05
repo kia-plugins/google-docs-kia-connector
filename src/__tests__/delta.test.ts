@@ -1,0 +1,299 @@
+/**
+ * Delta suite: changes.list ingest with per-page cursor commits, query-first
+ * deletions, scope checks against the resolved real root, per-file fault
+ * tolerance (the v1-bug-3 regression test), invalid-token recovery, and auth
+ * propagation.
+ */
+import { createGoogleDocsSource, type DriveCursor, type DriveItem } from '../source';
+import { GoogleDocsAuthError } from '../client';
+import type { Batch } from '../kiagent-contracts';
+import {
+  collect,
+  driveFetch,
+  fakeDoc,
+  fakeQuery,
+  folder,
+  gdoc,
+  instantClock,
+  jsonRes,
+  makeHost,
+  makeSession,
+  pdf,
+} from '../testing/harness';
+
+type B = Batch<DriveCursor, DriveItem>;
+
+const LIVE = { page_token: 'pt-1', backfill_done: true };
+
+function makeSource(world: Parameters<typeof driveFetch>[0], query = fakeQuery()) {
+  const { fetchFn, calls } = driveFetch(world);
+  const source = createGoogleDocsSource(makeHost(fetchFn, query), instantClock);
+  return { source, calls, query };
+}
+
+describe('delta', () => {
+  it('ingests an in-scope add/modify and commits newStartPageToken', async () => {
+    const { source, calls } = makeSource({
+      changes: {
+        'pt-1': {
+          changes: [{ fileId: 'docA', file: gdoc('docA', 'Doc A') }],
+          newStartPageToken: 'nspt-2',
+        },
+      },
+      exportsMd: { docA: '# Doc A v2' },
+    });
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0].phase).toBe('live');
+    expect(batches[0].items.map((i) => i.file.id)).toEqual(['docA']);
+    expect(batches[0].items[0].markdown).toBe('# Doc A v2');
+    expect(batches[0].deletions).toEqual([]);
+    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    // My Drive root resolved once for the scope walk ('root' is an alias).
+    expect(calls.filter((u) => u.includes('/files/root'))).toHaveLength(1);
+  });
+
+  it('removed change → deletion refs ONLY for locally existing types (query-first)', async () => {
+    const query = fakeQuery([fakeDoc('gone1', 'gdocs.doc', {})]);
+    const { source } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [{ fileId: 'gone1', removed: true }],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'gone1', type: 'gdocs.doc' }]);
+    expect(batches[0].items).toEqual([]);
+    // Both types probed, only the existing one emitted.
+    expect(query.byExternalIdCalls.map((c) => c.type).sort()).toEqual(['file', 'gdocs.doc']);
+  });
+
+  it('trashed file → same query-first deletion path', async () => {
+    const query = fakeQuery([fakeDoc('tr1', 'file', {})]);
+    const { source } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [{ fileId: 'tr1', file: pdf('tr1', 't.pdf', { trashed: true }) }],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+    expect(batches[0].deletions).toEqual([{ externalId: 'tr1', type: 'file' }]);
+  });
+
+  it('out-of-scope move → deletion ref for the locally existing doc, nothing downloaded', async () => {
+    const query = fakeQuery([fakeDoc('mv1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [{ fileId: 'mv1', file: pdf('mv1', 'm.pdf', { parents: ['OUTSIDE'] }) }],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        gets: { OUTSIDE: folder('OUTSIDE', 'Outside', { parents: [] }) },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'mv1', type: 'file' }]);
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+  });
+
+  it('folder change updates the in-memory index (no crash, no item) and later files use it', async () => {
+    const { source, calls } = makeSource({
+      changes: {
+        'pt-1': {
+          changes: [
+            { fileId: 'SUB', file: folder('SUB', 'Sub', { parents: ['MYDRIVE'] }) },
+            { fileId: 'docN', file: gdoc('docN', 'Nested', { parents: ['SUB'] }) },
+          ],
+          newStartPageToken: 'nspt-2',
+        },
+      },
+      exportsMd: { docN: '# Nested' },
+    });
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].items.map((i) => i.file.id)).toEqual(['docN']);
+    expect(batches[0].items[0].displayPath).toBe('My Drive / Sub');
+    // The folder came from the change feed — no shallow ancestor fetch needed.
+    expect(calls.some((u) => u.includes('/files/SUB'))).toBe(false);
+  });
+
+  it('fetches unknown ancestors shallow on demand and caches them across files', async () => {
+    const { source, calls } = makeSource({
+      changes: {
+        'pt-1': {
+          changes: [
+            { fileId: 'd1', file: gdoc('d1', 'One', { parents: ['P1'] }) },
+            { fileId: 'd2', file: gdoc('d2', 'Two', { parents: ['P1'] }) },
+          ],
+          newStartPageToken: 'nspt-2',
+        },
+      },
+      gets: { P1: folder('P1', 'Deep', { parents: ['MYDRIVE'] }) },
+      exportsMd: { d1: '# 1', d2: '# 2' },
+    });
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].items.map((i) => i.displayPath)).toEqual([
+      'My Drive / Deep',
+      'My Drive / Deep',
+    ]);
+    expect(calls.filter((u) => u.includes('/files/P1'))).toHaveLength(1);
+  });
+
+  it('one failing file is warn-skipped, the rest of the tick proceeds (v1 bug #3 regression)', async () => {
+    const { source } = makeSource({
+      changes: {
+        'pt-1': {
+          changes: [
+            { fileId: 'bad1', file: pdf('bad1', 'bad.pdf') },
+            { fileId: 'good1', file: gdoc('good1', 'Good') },
+          ],
+          newStartPageToken: 'nspt-2',
+        },
+      },
+      media: { bad1: jsonRes(404, { error: { message: 'File not found' } }) },
+      exportsMd: { good1: '# Good' },
+    });
+    const { session, logs } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].items.map((i) => i.file.id)).toEqual(['good1']);
+    expect(logs.some((l) => l.level === 'warn' && /file bad1 skipped/.test(l.msg))).toBe(true);
+    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+  });
+
+  it('commits per page: crash between pages resumes at nextPageToken', async () => {
+    const { source } = makeSource({
+      changes: {
+        'pt-1': {
+          changes: [{ fileId: 'd1', file: gdoc('d1', 'One') }],
+          nextPageToken: 'pt-2',
+        },
+        'pt-2': {
+          changes: [{ fileId: 'd2', file: gdoc('d2', 'Two') }],
+          newStartPageToken: 'nspt-9',
+        },
+      },
+      exportsMd: { d1: '# 1', d2: '# 2' },
+    });
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches).toHaveLength(2);
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-2', backfill_done: true });
+    expect(batches[1].cursor).toEqual({ page_token: 'nspt-9', backfill_done: true });
+  });
+
+  it('dedupes a page by fileId keeping the LAST change', async () => {
+    const query = fakeQuery([]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'd1', file: gdoc('d1', 'Old name') },
+              { fileId: 'd1', removed: true },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    // Only the removal is processed — no export attempted for the stale change.
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('/export'))).toBe(false);
+  });
+
+  it('invalid page token → recovery batch { page_token: "", backfill_done: false } and return', async () => {
+    const { source } = makeSource({ changesInvalid: ['pt-bad'] });
+    const { session, logs } = makeSession();
+
+    const batches = (await collect(
+      source.pull(session, { page_token: 'pt-bad', backfill_done: true }),
+    )) as B[];
+
+    expect(batches).toEqual([
+      { phase: 'live', items: [], cursor: { page_token: '', backfill_done: false } },
+    ]);
+    expect(logs.some((l) => l.level === 'warn' && /page token rejected/.test(l.msg))).toBe(true);
+  });
+
+  it('auth 401 on changes.list propagates out of the generator', async () => {
+    const { source } = makeSource({
+      custom: (url) =>
+        url.pathname === '/drive/v3/changes'
+          ? jsonRes(401, { error: { message: 'Invalid Credentials' } })
+          : undefined,
+    });
+    const { session } = makeSession();
+
+    await expect(collect(source.pull(session, LIVE))).rejects.toThrow(GoogleDocsAuthError);
+  });
+
+  it('honors a configured root folder: no files/root call, scope matched against it', async () => {
+    const query = fakeQuery([fakeDoc('out1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'in1', file: gdoc('in1', 'In', { parents: ['FOLD1'] }) },
+              { fileId: 'out1', file: pdf('out1', 'out.pdf', { parents: ['MYDRIVE'] }) },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        gets: { MYDRIVE: folder('MYDRIVE', 'My Drive', { parents: [] }) },
+        exportsMd: { in1: '# In' },
+      },
+      query,
+    );
+    const { session } = makeSession({
+      config: { rootFolderId: 'FOLD1', rootName: 'Projects' },
+    });
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(calls.some((u) => u.includes('/files/root'))).toBe(false);
+    expect(batches[0].items.map((i) => i.file.id)).toEqual(['in1']);
+    expect(batches[0].items[0].displayPath).toBe('Projects');
+    // A file under My Drive but outside FOLD1 is out of scope → archived.
+    expect(batches[0].deletions).toEqual([{ externalId: 'out1', type: 'file' }]);
+  });
+});
