@@ -211,7 +211,13 @@ async function hashSkip(
     type,
   );
   if (!existing || existing.archivedAt) return false;
-  return (existing.metadata as Record<string, unknown>)[metaKey] === value;
+  const meta = existing.metadata as Record<string, unknown>;
+  // A 'failed' row (both exports exhausted — possibly just a quota storm)
+  // must be retried on the next walk/tick: never pin it behind an unchanged
+  // revision id. 'too-large'/'unsupported' rows still skip — re-fetching
+  // changes nothing for those.
+  if (meta.extraction_status === 'failed') return false;
+  return meta[metaKey] === value;
 }
 
 function metadataOnly(
@@ -305,6 +311,11 @@ async function buildItem(
     const bytes = await deps.client.request<Uint8Array>(mediaUrl(file.id), {
       responseType: 'bytes',
     });
+    // Post-download cap: Drive binaries virtually always carry `size`, but
+    // the cap is the guarantee — an unknown-size file must not slip past it.
+    if (bytes.byteLength > MAX_BINARY_BYTES) {
+      return metadataOnly(file, 'file', 'too-large', displayPath, deps.root.rootFolderId);
+    }
     return {
       file,
       docType: 'file',
@@ -346,6 +357,9 @@ async function* backfill(
   const deps: ItemDeps = { client, session, query, root };
   const index: FolderIndex = new Map();
   // BFS queue: folder id + its display-path segments below the root.
+  // `walked` bounds the walk against folder cycles / duplicate listings —
+  // impossible under Drive's single-parent model, so defense-in-depth only.
+  const walked = new Set<string>([root.rootFolderId]);
   const queue: { folderId: string; segments: string[]; pageToken?: string }[] = [
     { folderId: root.rootFolderId, segments: [] },
   ];
@@ -362,7 +376,10 @@ async function* backfill(
       if (session.signal.aborted) return;
       if (f.mimeType === GOOGLE_FOLDER_MIME) {
         index.set(f.id, { name: f.name, parents: f.parents ?? [] });
-        queue.push({ folderId: f.id, segments: [...head.segments, f.name] });
+        if (!walked.has(f.id)) {
+          walked.add(f.id);
+          queue.push({ folderId: f.id, segments: [...head.segments, f.name] });
+        }
         continue;
       }
       try {
@@ -392,7 +409,14 @@ async function* backfill(
 /** Walk ancestors from `file` up to `targetRootId` (≤64 hops, cycle-safe —
  *  v1 path-resolver simplified to a single root). Unknown ancestors are
  *  fetched shallow on demand and cached in the index. Returns the display
- *  segments (top-down, root excluded) when in scope. */
+ *  segments (top-down, root excluded) when in scope.
+ *
+ *  Simplified to the FIRST parent chain only — v1's path-resolver BFS'd
+ *  every parent chain. Drive migrated multi-parent files to shortcuts in
+ *  2020, so the exposure is a rare legacy tail: such a file whose first
+ *  listed parent chain exits the root is treated as out of scope (archived
+ *  on its next change; the next backfill/reconcile pass under the root
+ *  restores it). */
 async function resolveScope(
   file: DriveFile,
   targetRootId: string,
@@ -473,9 +497,15 @@ async function* delta(
       page = await client.request<ChangesPage>(changesUrl(pageToken));
     } catch (e) {
       if (isAuthError(e)) throw e;
-      // v1 delta.ts invalid-token regex, matched against the client's
-      // `drive <status> <url> <body>` message format.
-      if (/page token is invalid|invalid value|400|404/i.test(errText(e))) {
+      // v1 delta.ts's invalid-token check, hardened: v1 regexed
+      // /…|400|404/ against the whole `drive <status> <url> <body>` message,
+      // but the URL embeds the (typically numeric) pageToken, so a token
+      // containing "400" made ANY non-auth failure look invalid. Anchor the
+      // status codes on the typed error; keep v1's phrase matches.
+      const invalidToken =
+        (e instanceof DriveApiError && (e.status === 400 || e.status === 404)) ||
+        /page token is invalid|invalid value/i.test(errText(e));
+      if (invalidToken) {
         session.log(
           'warn',
           `google-docs delta: changes page token rejected (${errText(e)}) — scheduling a re-walk`,
@@ -652,6 +682,19 @@ export function createGoogleDocsSource(
           md5_checksum: f.md5Checksum ?? null,
           extraction_status: item.extractionStatus,
           root_folder_id: item.rootFolderId,
+          // Engine vision/classify aliases: kiagent-core's vision pipeline
+          // reads metadata.mime / filename / sizeBytes (classify.ts:10-15),
+          // not the v1-named keys above. Emitted on 'file' docs so
+          // extension-less pdfs/images still classify, the tiny-image guard
+          // applies, and undecodable text-poor images don't re-drive the
+          // vision worker every cadence.
+          ...(item.docType === 'file'
+            ? {
+                mime: f.mimeType,
+                filename: f.name,
+                ...(f.size != null ? { sizeBytes: Number(f.size) } : {}),
+              }
+            : {}),
         },
         createdAt: f.createdTime ?? f.modifiedTime ?? null,
       };
@@ -694,6 +737,8 @@ export function createGoogleDocsSource(
     async *reconcile(session: Session): AsyncIterable<ExternalRef[]> {
       const client = clientFor(session);
       const root = rootConfig(session);
+      // Cycle/duplicate guard, same rationale as backfill's `walked` set.
+      const walked = new Set<string>([root.rootFolderId]);
       const queue: string[] = [root.rootFolderId];
       while (queue.length > 0) {
         if (session.signal.aborted) return;
@@ -705,7 +750,10 @@ export function createGoogleDocsSource(
           const refs: ExternalRef[] = [];
           for (const f of page.files ?? []) {
             if (f.mimeType === GOOGLE_FOLDER_MIME) {
-              queue.push(f.id);
+              if (!walked.has(f.id)) {
+                walked.add(f.id);
+                queue.push(f.id);
+              }
               continue;
             }
             if (f.mimeType === GOOGLE_SHORTCUT_MIME) {

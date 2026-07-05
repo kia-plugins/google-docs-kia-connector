@@ -142,6 +142,11 @@ describe('toDocument', () => {
     expect(doc.metadata.size_bytes).toBe(2048);
     expect(doc.metadata.md5_checksum).toBe('md5-pdfB-1');
     expect(doc.createdAt).toBe('2026-05-02T10:00:00Z'); // modifiedTime fallback
+    // Engine vision/classify aliases ride alongside the v1-named keys on
+    // 'file' docs (kiagent-core classify.ts reads mime/filename/sizeBytes).
+    expect(doc.metadata.mime).toBe('application/pdf');
+    expect(doc.metadata.filename).toBe('b.pdf');
+    expect(doc.metadata.sizeBytes).toBe(2048);
   });
 
   it('maps a metadata-only item: empty-string markdown, NO binary', () => {
@@ -166,6 +171,11 @@ describe('toDocument', () => {
     expect(doc.markdown).toBe('');
     expect(doc.binary).toBeUndefined();
     expect(doc.metadata.extraction_status).toBe('unsupported');
+    // Aliases present on metadata-only 'file' docs too; sizeBytes omitted
+    // when Drive reports no size (classify's ?? fallback handles absence).
+    expect(doc.metadata.mime).toBe('application/vnd.google-apps.spreadsheet');
+    expect(doc.metadata.filename).toBe('Budget');
+    expect('sizeBytes' in doc.metadata).toBe(false);
   });
 });
 

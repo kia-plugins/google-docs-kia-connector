@@ -1,15 +1,4 @@
 /**
- * Vendored snapshot of kiagent-core src/shared/contracts.ts @ fb0c444 — the
- * contract IS the SDK (LEFTOVERS #15); do not edit, re-vendor.
- *
- * Re-vendored from kiagent-core (branch greenfield) rather than copied from
- * the notion-kia-connector snapshot (@ c6ee4e0): the platform's parallel
- * OAuth change added OAuthProviderId / SourceContribution — the object-form
- * `contributes.sources` entry ({ id, oauth: 'google' }) this connector's
- * manifest.json uses.
- */
-
-/**
  * KIAgent domain contracts — the one place every entity and surface is defined.
  *
  * The design (see concept/greenfield.ts for the full rationale): the app is a
@@ -468,6 +457,15 @@ export type SourceContribution =
   | string
   | { id: string; oauth: OAuthProviderId };
 
+/** A source that signs in through a platform OAuth provider. Surfaced at
+ *  install/update/review consent and on the marketplace detail view — the
+ *  user must see that a third-party source will open a provider sign-in
+ *  window before install, not only at connect time. */
+export interface OAuthSourceBinding {
+  id: string;
+  provider: OAuthProviderId;
+}
+
 export interface Manifest {
   id: ExtensionId;
   name: string;
@@ -583,6 +581,9 @@ export interface ExtensionSnapshot {
   error?: string;
   caps: Cap[];
   sourceIds: string[];
+  /** Sources bound to a platform OAuth provider — rendered alongside caps
+   *  wherever permissions are shown (marketplace detail, review consent). */
+  oauthSources: OAuthSourceBinding[];
   ref?: string;
 }
 

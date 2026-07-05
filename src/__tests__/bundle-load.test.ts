@@ -12,6 +12,17 @@ describe('dist bundle loads standalone', () => {
   it('require()s dist/index.js and activate() returns the google-docs source', async () => {
     const root = join(__dirname, '..', '..');
     execSync('npm run build', { cwd: root });
+
+    // Bare Node child-process require — proves the bundle loads outside
+    // jest's module registry, the way the extension host child loads it.
+    const out = execSync(
+      'node -e "const m=require(\'./dist/index.js\');const e=m.default??m;' +
+        "if(typeof e.activate!=='function')throw new Error('no activate');" +
+        'console.log(\'activate:\'+typeof e.activate)"',
+      { cwd: root },
+    ).toString();
+    expect(out).toContain('activate:function');
+
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const mod = require(join(root, 'dist', 'index.js'));
     const entry = mod.default ?? mod;

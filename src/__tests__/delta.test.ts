@@ -254,6 +254,23 @@ describe('delta', () => {
     expect(logs.some((l) => l.level === 'warn' && /page token rejected/.test(l.msg))).toBe(true);
   });
 
+  it('does not misread a numeric page token as invalid during a 5xx outage (propagates)', async () => {
+    // The token embeds "404"; the old whole-message regex would have turned
+    // ANY non-auth failure into a full re-walk. The status is now anchored
+    // on the typed error instead.
+    const { source } = makeSource({
+      custom: (url) =>
+        url.pathname === '/drive/v3/changes'
+          ? jsonRes(500, { error: { message: 'Backend Error' } })
+          : undefined,
+    });
+    const { session } = makeSession();
+
+    await expect(
+      collect(source.pull(session, { page_token: 'pt-40404', backfill_done: true })),
+    ).rejects.toThrow(/drive 500/);
+  });
+
   it('auth 401 on changes.list propagates out of the generator', async () => {
     const { source } = makeSource({
       custom: (url) =>

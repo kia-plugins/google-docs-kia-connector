@@ -4,7 +4,12 @@
  * routing (unsupported / too-large), hash-skip, per-file fault tolerance,
  * abort, resume-without-recapture, and auth propagation.
  */
-import { createGoogleDocsSource, type DriveCursor, type DriveItem } from '../source';
+import {
+  createGoogleDocsSource,
+  MAX_BINARY_BYTES,
+  type DriveCursor,
+  type DriveItem,
+} from '../source';
 import { GoogleDocsAuthError } from '../client';
 import type { Batch } from '../kiagent-contracts';
 import {
@@ -216,6 +221,46 @@ describe('backfill', () => {
 
     const batches = (await collect(source.pull(session, null))) as B[];
     expect(batches.flatMap(ids)).toEqual(['docA']);
+  });
+
+  it('hash-skip does NOT apply to a failed-extraction row — the export IS re-attempted', async () => {
+    const query = fakeQuery([
+      fakeDoc('docA', 'gdocs.doc', {
+        head_revision_id: 'rev-docA-1', // matches the listed revision…
+        extraction_status: 'failed', // …but the last walk's exports failed
+      }),
+    ]);
+    const { source, calls } = makeSource(
+      { lists: { root: [gdoc('docA', 'Doc A')] }, exportsMd: { docA: '# Doc A' } },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, null))) as B[];
+
+    expect(calls.some((u) => u.includes('/export'))).toBe(true);
+    expect(batches.flatMap(ids)).toEqual(['docA']);
+    expect(batches[0].items[0]).toMatchObject({
+      markdown: '# Doc A',
+      extractionStatus: 'ok',
+    });
+  });
+
+  it('caps an unknown-size binary AFTER download (post-hoc too-large row, no bytes emitted)', async () => {
+    const { source } = makeSource({
+      lists: { root: [pdf('nosize1', 'n.pdf', { size: undefined })] },
+      media: { nosize1: new Uint8Array(MAX_BINARY_BYTES + 1) },
+    });
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, null))) as B[];
+
+    expect(batches[0].items[0]).toMatchObject({
+      docType: 'file',
+      markdown: '',
+      extractionStatus: 'too-large',
+    });
+    expect(batches[0].items[0].bytes).toBeUndefined();
   });
 
   it('one unreadable file is warn-skipped and the walk continues', async () => {
