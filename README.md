@@ -22,12 +22,38 @@ connector needs before it activates:
    scope `https://www.googleapis.com/auth/drive.readonly` and never sees your
    Google password; tokens live in KIAgent's encrypted vault and are
    refreshed by the platform.
-2. Optionally paste a Google Drive **folder URL or ID** when prompted to index
-   only that folder. Leave the field blank to index all of **My Drive**.
+2. Pick the folders to index in KIAgent's folder picker. Two tabs — **My
+   Drive** and **Shared with me** — let you browse the folder tree lazily and
+   select **multiple folders** (selecting a folder covers its whole subtree,
+   so a selected folder's descendants can't be selected again). Each row
+   shows a recursive file count as an orientation aid: the count walks at
+   most 20 Drive listing pages and stops at 50,000 files, showing "N+" when
+   that budget is hit (a lower bound, and shortcuts are counted without
+   resolving their targets). To index everything, just pick **My Drive**
+   itself. Every folder row offers an expand arrow even when the folder has
+   no subfolders — probing every row for children would cost one API call
+   each, so an expand may simply come up empty.
 3. The account shows up under your Google account's email address and
    backfills from there, then checks for changes every 15 minutes.
 
 You can connect multiple Google accounts side by side.
+
+### Tracked-roots config
+
+The picker writes the account config as
+
+```json
+{ "roots": [ { "rootFolderId": "<drive folder id>", "rootName": "<name>" } ] }
+```
+
+with one entry per selected folder (`"root"` is Drive's alias for My Drive).
+Accounts connected with v2.0.0 keep working unchanged: the legacy
+single-root config `{ "rootFolderId": "...", "rootName": "..." }` is
+normalized to a one-entry roots list on every sync (missing `rootName` falls
+back to "My Drive" for `root`, the raw id otherwise), and an account with no
+root config at all still means all of My Drive. Duplicate root ids are
+ignored (first entry wins). If one tracked root lies inside another, the
+overlapping subtree is indexed once — under whichever root reaches it first.
 
 ## What gets indexed
 
@@ -41,8 +67,9 @@ You can connect multiple Google accounts side by side.
   oversized files) — indexed as metadata-only entries: title, folder path,
   link, timestamps.
 - **Folder paths** — every document records a human-readable `display_path`
-  from your chosen root.
-- Files deleted, trashed, or moved out of the indexed folder are archived
+  from the tracked root it was found under (and that root's id as
+  `root_folder_id`).
+- Files deleted, trashed, or moved out of every indexed folder are archived
   from the local index. Shortcuts are resolved to their targets.
 
 Unchanged files are skipped by content hash (Drive's `headRevisionId` /
@@ -54,11 +81,12 @@ Unchanged files are skipped by content hash (Drive's `headRevisionId` /
 - All content stays on your machine — extraction and OCR run locally in
   KIAgent; this extension ships no Google client credentials and stores no
   tokens itself.
-- Only the folder you choose (or My Drive) is read.
+- Only the folders you choose (or My Drive) are read.
 
 ## Limitations
 
-- **Shared Drives are not indexed** (My Drive and folders under it only).
+- **Shared Drives (Team Drives) are not indexed** — My Drive and
+  shared-with-me folders only.
 - Sheets and Slides are indexed as metadata only — content export is
   deferred.
 - Renaming or moving a folder does not re-render the recorded `display_path`
