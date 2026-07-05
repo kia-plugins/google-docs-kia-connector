@@ -1,6 +1,12 @@
 /**
- * Vendored snapshot of kiagent-core src/shared/contracts.ts @ c6ee4e0 — the
+ * Vendored snapshot of kiagent-core src/shared/contracts.ts @ fb0c444 — the
  * contract IS the SDK (LEFTOVERS #15); do not edit, re-vendor.
+ *
+ * Re-vendored from kiagent-core (branch greenfield) rather than copied from
+ * the notion-kia-connector snapshot (@ c6ee4e0): the platform's parallel
+ * OAuth change added OAuthProviderId / SourceContribution — the object-form
+ * `contributes.sources` entry ({ id, oauth: 'google' }) this connector's
+ * manifest.json uses.
  */
 
 /**
@@ -449,6 +455,19 @@ export type Cap =
   | 'inference'
   | 'events';
 
+/** Platform-side OAuth providers an extension source may bind to. The
+ *  platform owns the provider's profile (auth URL + token exchange) and
+ *  refresher — the extension never sees a client secret. */
+export type OAuthProviderId = 'google';
+
+/** A `contributes.sources` entry: a bare source id, or an id plus an OAuth
+ *  provider binding — `{ id: 'google-docs', oauth: 'google' }` makes
+ *  `auth.oauth(scopes)` work during that source's connect flow and enables
+ *  platform-side token refresh during pull. */
+export type SourceContribution =
+  | string
+  | { id: string; oauth: OAuthProviderId };
+
 export interface Manifest {
   id: ExtensionId;
   name: string;
@@ -458,7 +477,7 @@ export interface Manifest {
    *  inside the extension directory (containment-checked at validation). */
   entry: string;
   contributes: {
-    sources?: string[];
+    sources?: SourceContribution[];
     workers?: string[];
     tools?: string[];
     providers?: string[];
