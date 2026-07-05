@@ -289,12 +289,42 @@ export interface Session {
   log(level: LogLevel, msg: string): void;
 }
 
+/** One row of the shared folder-picker tree. */
+export interface FolderNode {
+  id: string; // opaque source-defined id; never contains '/'
+  name: string;
+  hasChildren: boolean;
+}
+
+export interface FolderCount {
+  count: number;
+  capped: boolean; // budget ran out; count is a lower bound
+}
+
+/** What a source hands `AuthChannel.pickFolders`: mode tabs plus lazy
+ *  callbacks the picker invokes while it is open. A rejected callback shows
+ *  the node as empty/uncounted in the UI (the flow does not die) — still,
+ *  `count` should catch errors and resolve `null`; `roots`/`children` reject
+ *  only on genuine API failure. */
+export interface FolderPickerSpec {
+  modes: Array<{ key: string; label: string }>;
+  multiSelect?: boolean;
+  roots(modeKey: string): Promise<FolderNode[]>;
+  children(id: string): Promise<FolderNode[]>; // child FOLDERS only
+  count?(id: string): Promise<FolderCount | null>;
+}
+
 /** Interactive account establishment — the one moment a source talks to the
  *  UI. Credentials from `oauth()` are persisted by the platform. */
 export interface AuthChannel {
   oauth(scopes: string[]): Promise<Credentials>;
   showQr(qr: string): void;
   prompt(schema: unknown): Promise<Record<string, unknown>>;
+  /** The shared folder-picker UI (lazy tree, per-row recursive counts).
+   *  Resolves with covering roots (never both a node and its descendant).
+   *  Rejects if the user cancels — let that rejection propagate out of
+   *  connect(). */
+  pickFolders(spec: FolderPickerSpec): Promise<FolderNode[]>;
   status(msg: string): void;
 }
 

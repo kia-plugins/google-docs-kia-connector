@@ -13,6 +13,8 @@ import type {
   AuthChannel,
   Credentials,
   Document,
+  FolderNode,
+  FolderPickerSpec,
   HostFor,
   Query,
   Session,
@@ -241,16 +243,24 @@ export function makeSession(
 }
 
 export function makeAuth(
-  opts: { creds?: Credentials; answers?: Record<string, unknown> } = {},
+  opts: {
+    creds?: Credentials;
+    answers?: Record<string, unknown>;
+    /** pickFolders resolves this selection (default: My Drive) — or, when a
+     *  function, drives the spec itself (e.g. to reject as a user cancel). */
+    picked?: FolderNode[] | ((spec: FolderPickerSpec) => Promise<FolderNode[]>);
+  } = {},
 ): {
   auth: AuthChannel;
   statuses: string[];
   getScopes: () => string[] | undefined;
   getSchema: () => unknown;
+  getPickerSpec: () => FolderPickerSpec | undefined;
 } {
   const statuses: string[] = [];
   let scopes: string[] | undefined;
   let schema: unknown;
+  let pickerSpec: FolderPickerSpec | undefined;
   const auth: AuthChannel = {
     oauth: async (s) => {
       scopes = s;
@@ -261,9 +271,20 @@ export function makeAuth(
       schema = s;
       return opts.answers ?? {};
     },
+    pickFolders: async (spec) => {
+      pickerSpec = spec;
+      if (typeof opts.picked === 'function') return opts.picked(spec);
+      return opts.picked ?? [{ id: 'root', name: 'My Drive', hasChildren: true }];
+    },
     status: (m) => statuses.push(m),
   };
-  return { auth, statuses, getScopes: () => scopes, getSchema: () => schema };
+  return {
+    auth,
+    statuses,
+    getScopes: () => scopes,
+    getSchema: () => schema,
+    getPickerSpec: () => pickerSpec,
+  };
 }
 
 export function fakeDoc(
