@@ -289,28 +289,37 @@ export interface Session {
   log(level: LogLevel, msg: string): void;
 }
 
-/** One row of the shared folder-picker tree. */
+/** A folder node shown in the connect-time folder picker. `id` is opaque and
+ *  source-defined (a Drive folder id, a filesystem path, …); it never
+ *  contains `/`. */
 export interface FolderNode {
-  id: string; // opaque source-defined id; never contains '/'
+  id: string;
   name: string;
   hasChildren: boolean;
 }
 
+/** Result of a recursive file count under one folder. `capped` means the
+ *  count budget ran out and `count` is a lower bound. */
 export interface FolderCount {
   count: number;
-  capped: boolean; // budget ran out; count is a lower bound
+  capped: boolean;
 }
 
-/** What a source hands `AuthChannel.pickFolders`: mode tabs plus lazy
- *  callbacks the picker invokes while it is open. A rejected callback shows
- *  the node as empty/uncounted in the UI (the flow does not die) — still,
- *  `count` should catch errors and resolve `null`; `roots`/`children` reject
- *  only on genuine API failure. */
+/** Tree callbacks + display options a source hands to
+ *  {@link AuthChannel.pickFolders}. Callbacks are invoked lazily while the
+ *  picker is open; they may reject — the picker shows the node as empty /
+ *  uncounted rather than failing the flow. */
 export interface FolderPickerSpec {
+  /** Tabs shown in the picker, in order; at least one. */
   modes: Array<{ key: string; label: string }>;
+  /** Allow selecting multiple folders (covering-root semantics). */
   multiSelect?: boolean;
+  /** Top-level nodes for a mode tab. */
   roots(modeKey: string): Promise<FolderNode[]>;
-  children(id: string): Promise<FolderNode[]>; // child FOLDERS only
+  /** Child FOLDERS of a node (files are not listed in the picker). */
+  children(id: string): Promise<FolderNode[]>;
+  /** Recursive file count under a node; omit the method (or resolve null)
+   *  when counting is unavailable. */
   count?(id: string): Promise<FolderCount | null>;
 }
 
@@ -320,12 +329,11 @@ export interface AuthChannel {
   oauth(scopes: string[]): Promise<Credentials>;
   showQr(qr: string): void;
   prompt(schema: unknown): Promise<Record<string, unknown>>;
-  /** The shared folder-picker UI (lazy tree, per-row recursive counts).
-   *  Resolves with covering roots (never both a node and its descendant).
-   *  Rejects if the user cancels — let that rejection propagate out of
-   *  connect(). */
-  pickFolders(spec: FolderPickerSpec): Promise<FolderNode[]>;
   status(msg: string): void;
+  /** Show the shared folder-picker UI backed by the given tree callbacks.
+   *  Resolves with the selected folders (covering roots — never both a node
+   *  and its own descendant). Rejects if the user cancels. */
+  pickFolders(spec: FolderPickerSpec): Promise<FolderNode[]>;
 }
 
 /** The entire connector-authoring surface. */
