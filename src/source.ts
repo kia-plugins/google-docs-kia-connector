@@ -1,8 +1,9 @@
 /**
- * Google Docs / Drive v2 source: platform-owned OAuth connect (with one
- * optional root-folder prompt), BFS backfill with page-aligned batches, a
- * changes.list delta with per-page cursor commits, full-listing reconcile,
- * fetchBytes for the engine's deep-extraction passes, and a pure toDocument.
+ * Google Docs / Drive v2 source: platform-owned OAuth connect (root folders
+ * chosen in the platform's shared folder-picker), BFS backfill with
+ * page-aligned batches, a changes.list delta with per-page cursor commits,
+ * full-listing reconcile, fetchBytes for the engine's deep-extraction
+ * passes, and a pure toDocument.
  *
  * Ported from alpha-cent's v1 connector (`git show
  * main:src/main/connectors/google-docs/<file>.ts`): backfill.ts's walkFolder
@@ -121,18 +122,6 @@ interface RootConfig {
 type FolderIndex = Map<string, { name: string; parents: string[] }>;
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-
-/** Parse the connect prompt's folder input: a `folders/<id>` URL segment, an
- *  `?id=` query param, or a raw id; blank → 'root' (My Drive). */
-export function parseRootInput(raw: string): string {
-  const t = raw.trim();
-  if (!t) return 'root';
-  const folders = /folders\/([A-Za-z0-9_-]+)/.exec(t);
-  if (folders) return folders[1];
-  const idParam = /[?&]id=([A-Za-z0-9_-]+)/.exec(t);
-  if (idParam) return idParam[1];
-  return t;
-}
 
 // ── Folder-picker callbacks (connect-time UI) ───────────────────────────────
 // Invoked lazily by the platform's shared picker while it is open.
@@ -728,43 +717,26 @@ export function createGoogleDocsSource(
         throw new Error('google-docs: Drive about response missing user.emailAddress');
       }
 
-      const answers = await auth.prompt({
-        type: 'object',
-        properties: {
-          root: {
-            type: 'string',
-            title: 'Folder to index (optional)',
-            description:
-              'Paste a Google Drive folder URL or ID to index only that folder. Leave blank to index My Drive.',
-          },
-        },
+      // The platform's shared folder-picker: lazy tree over the connect-time
+      // client, multi-select with covering roots. A user cancel rejects —
+      // let that propagate out of connect().
+      const picked = await auth.pickFolders({
+        modes: [
+          { key: 'my-drive', label: 'My Drive' },
+          { key: 'shared', label: 'Shared with me' },
+        ],
+        multiSelect: true,
+        roots: async (mode) =>
+          mode === 'my-drive'
+            ? [{ id: 'root', name: 'My Drive', hasChildren: true }]
+            : listSharedRoots(client),
+        children: (id) => listChildFolders(client, id),
+        count: (id) => countFilesUnder(client, id),
       });
-      const rootFolderId = parseRootInput(
-        typeof answers.root === 'string' ? answers.root : '',
-      );
-      let rootName = 'My Drive';
-      if (rootFolderId !== 'root') {
-        let folder: { id: string; name: string; mimeType: string };
-        try {
-          folder = await client.request(
-            `${DRIVE_API}/files/${encodeURIComponent(rootFolderId)}?fields=id,name,mimeType`,
-          );
-        } catch (e) {
-          throw new Error(
-            `google-docs: could not open folder "${rootFolderId}" — check the URL or ID (${errText(e)})`,
-          );
-        }
-        if (folder.mimeType !== GOOGLE_FOLDER_MIME) {
-          throw new Error(
-            `google-docs: "${folder.name}" is not a folder — paste a folder URL or ID, or leave blank to index My Drive`,
-          );
-        }
-        rootName = folder.name;
-      }
-
+      if (picked.length === 0) throw new Error('google-docs: no folders selected');
       return {
         identifier: about.user.emailAddress,
-        config: { rootFolderId, rootName },
+        config: { roots: picked.map((n) => ({ rootFolderId: n.id, rootName: n.name })) },
       };
     },
 
