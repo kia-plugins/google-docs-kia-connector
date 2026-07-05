@@ -335,6 +335,46 @@ describe('backfill', () => {
     });
   });
 
+  it('multi-root: seeds every root; a shared walked set ingests an overlapping subtree once', async () => {
+    // Root B (FB) lives INSIDE root A (FA) — the one overlap Drive's
+    // single-parent model allows. FB must be listed exactly once, and its
+    // items attributed to root B (each root is seeded before any listing).
+    const { source, calls } = makeSource({
+      startPageToken: 'spt-1',
+      lists: {
+        FA: [gdoc('a1', 'A doc', { parents: ['FA'] }), folder('FB', 'B Folder', { parents: ['FA'] })],
+        FB: [gdoc('b1', 'B doc', { parents: ['FB'] })],
+      },
+      exportsMd: { a1: '# A', b1: '# B' },
+    });
+    const { session } = makeSession({
+      config: {
+        roots: [
+          { rootFolderId: 'FA', rootName: 'Alpha' },
+          { rootFolderId: 'FB', rootName: 'Beta' },
+        ],
+      },
+    });
+
+    const batches = (await collect(source.pull(session, null))) as B[];
+
+    const items = batches.flatMap((b) => b.items);
+    // b1 exactly once — FB is never re-walked as a child of FA.
+    expect(items.map((i) => i.file.id)).toEqual(['a1', 'b1']);
+    expect(items[0]).toMatchObject({ displayPath: 'Alpha', rootFolderId: 'FA' });
+    expect(items[1]).toMatchObject({ displayPath: 'Beta', rootFolderId: 'FB' });
+    const fbLists = calls.filter((u) =>
+      (new URL(u).searchParams.get('q') ?? '').includes("'FB' in parents"),
+    );
+    expect(fbLists).toHaveLength(1);
+    // Still one shared cursor: stable until the single final live flip.
+    expect(batches[batches.length - 1]).toEqual({
+      phase: 'live',
+      items: [],
+      cursor: { page_token: 'spt-1', backfill_done: true },
+    });
+  });
+
   it('propagates auth errors out of the walk (401 on export)', async () => {
     const { source } = makeSource({
       lists: { root: [gdoc('docA', 'Doc A')] },

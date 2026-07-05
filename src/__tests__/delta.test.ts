@@ -283,6 +283,73 @@ describe('delta', () => {
     await expect(collect(source.pull(session, LIVE))).rejects.toThrow(GoogleDocsAuthError);
   });
 
+  it('multi-root: a change under the SECOND root is in scope; a file under neither is archived', async () => {
+    const query = fakeQuery([fakeDoc('nope1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'b1', file: gdoc('b1', 'In B', { parents: ['FOLD2'] }) },
+              { fileId: 'nope1', file: pdf('nope1', 'n.pdf', { parents: ['ELSEWHERE'] }) },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        gets: { ELSEWHERE: folder('ELSEWHERE', 'Elsewhere', { parents: [] }) },
+        exportsMd: { b1: '# In B' },
+      },
+      query,
+    );
+    const { session } = makeSession({
+      config: {
+        roots: [
+          { rootFolderId: 'FOLD1', rootName: 'Projects' },
+          { rootFolderId: 'FOLD2', rootName: 'Specs' },
+        ],
+      },
+    });
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    // No 'root' alias among the tracked roots → no files/root resolution.
+    expect(calls.some((u) => u.includes('/files/root'))).toBe(false);
+    expect(batches[0].items.map((i) => i.file.id)).toEqual(['b1']);
+    // Attribution comes from the root actually reached.
+    expect(batches[0].items[0]).toMatchObject({ displayPath: 'Specs', rootFolderId: 'FOLD2' });
+    expect(batches[0].deletions).toEqual([{ externalId: 'nope1', type: 'file' }]);
+  });
+
+  it("multi-root: the 'root' alias is resolved ONCE and matched by its real id", async () => {
+    const { source, calls } = makeSource({
+      rootId: 'MYDRIVE',
+      changes: {
+        'pt-1': {
+          changes: [
+            { fileId: 'm1', file: gdoc('m1', 'In My Drive', { parents: ['MYDRIVE'] }) },
+            { fileId: 'p1', file: gdoc('p1', 'In Projects', { parents: ['FOLD1'] }) },
+          ],
+          newStartPageToken: 'nspt-2',
+        },
+      },
+      exportsMd: { m1: '# M', p1: '# P' },
+    });
+    const { session } = makeSession({
+      config: {
+        roots: [
+          { rootFolderId: 'root', rootName: 'My Drive' },
+          { rootFolderId: 'FOLD1', rootName: 'Projects' },
+        ],
+      },
+    });
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(calls.filter((u) => u.includes('/files/root'))).toHaveLength(1);
+    expect(batches[0].items.map((i) => i.rootFolderId).sort()).toEqual(['FOLD1', 'root']);
+    expect(batches[0].items.map((i) => i.displayPath).sort()).toEqual(['My Drive', 'Projects']);
+  });
+
   it('honors a configured root folder: no files/root call, scope matched against it', async () => {
     const query = fakeQuery([fakeDoc('out1', 'file', {})]);
     const { source, calls } = makeSource(

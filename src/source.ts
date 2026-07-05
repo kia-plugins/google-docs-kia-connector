@@ -9,9 +9,10 @@
  * main:src/main/connectors/google-docs/<file>.ts`): backfill.ts's walkFolder
  * BFS, delta.ts's changes loop + invalid-token recovery, ingest.ts's routing
  * / shortcut resolution / hash-skip, path-resolver.ts's ancestor walk
- * (simplified to a single root). Platform pieces (SQLite tables, tracked
- * roots UI, converter pipeline, safeStorage token blobs, scheduler) are
- * replaced by the v2 engine.
+ * (first-parent chain against the tracked-root set — v1's tracked_roots
+ * multi-root model returns in v2.1.0). Platform pieces (SQLite tables,
+ * tracked roots UI, converter pipeline, safeStorage token blobs, scheduler)
+ * are replaced by the v2 engine.
  *
  * Deliberate v2 fixes over v1 (see README):
  *  - v1 bug #1 (runFullRescan's cross-account deletion): the full-rescan path
@@ -239,19 +240,49 @@ export async function countFilesUnder(
   }
 }
 
-function rootConfig(session: Session): RootConfig {
+/** Normalize account config to the tracked roots. Accepts the v2.1.0
+ *  multi-root shape (`roots: [{ rootFolderId, rootName }]`), the legacy
+ *  v2.0.0 single-root fields (`rootFolderId`/`rootName`), or nothing (all of
+ *  My Drive). Per-entry name fallback: 'My Drive' for the 'root' alias, the
+ *  id otherwise. Deduped by rootFolderId — first entry wins. */
+export function rootsConfig(session: Session): RootConfig[] {
   const cfg = session.account.config as {
+    roots?: unknown;
     rootFolderId?: unknown;
     rootName?: unknown;
   };
-  return {
-    rootFolderId:
-      typeof cfg.rootFolderId === 'string' && cfg.rootFolderId
-        ? cfg.rootFolderId
-        : 'root',
-    rootName:
-      typeof cfg.rootName === 'string' && cfg.rootName ? cfg.rootName : 'My Drive',
+  const nameFor = (id: string, name: unknown): string => {
+    if (typeof name === 'string' && name) return name;
+    return id === 'root' ? 'My Drive' : id;
   };
+
+  const parsed: RootConfig[] = [];
+  if (Array.isArray(cfg.roots)) {
+    for (const raw of cfg.roots) {
+      const r = raw as { rootFolderId?: unknown; rootName?: unknown } | null;
+      if (r && typeof r.rootFolderId === 'string' && r.rootFolderId) {
+        parsed.push({
+          rootFolderId: r.rootFolderId,
+          rootName: nameFor(r.rootFolderId, r.rootName),
+        });
+      }
+    }
+  }
+  if (parsed.length === 0) {
+    // Legacy v2.0.0 single-root config; no config at all → My Drive.
+    const id =
+      typeof cfg.rootFolderId === 'string' && cfg.rootFolderId ? cfg.rootFolderId : 'root';
+    parsed.push({ rootFolderId: id, rootName: nameFor(id, cfg.rootName) });
+  }
+
+  const seen = new Set<string>();
+  const deduped: RootConfig[] = [];
+  for (const r of parsed) {
+    if (seen.has(r.rootFolderId)) continue;
+    seen.add(r.rootFolderId);
+    deduped.push(r);
+  }
+  return deduped;
 }
 
 function listUrl(folderId: string, pageToken?: string): string {
@@ -296,7 +327,6 @@ interface ItemDeps {
   client: DriveClient;
   session: Session;
   query: Query;
-  root: RootConfig;
 }
 
 /** Query-first content-hash skip: an unchanged, still-live document is never
@@ -348,6 +378,7 @@ function metadataOnly(
 async function buildItem(
   raw: DriveFile,
   segments: string[],
+  root: RootConfig,
   deps: ItemDeps,
 ): Promise<DriveItem | null> {
   let file = raw;
@@ -364,7 +395,7 @@ async function buildItem(
     file = { ...target, parents: raw.parents };
   }
 
-  const displayPath = [deps.root.rootName, ...segments].join(' / ');
+  const displayPath = [root.rootName, ...segments].join(' / ');
   const route = chooseRoute(file.mimeType);
 
   if (route.kind === 'native') {
@@ -395,7 +426,7 @@ async function buildItem(
           'warn',
           `google-docs: export failed for ${file.id} (${errText(e2)}) — indexing metadata only`,
         );
-        return metadataOnly(file, 'gdocs.doc', 'failed', displayPath, deps.root.rootFolderId);
+        return metadataOnly(file, 'gdocs.doc', 'failed', displayPath, root.rootFolderId);
       }
     }
     return {
@@ -404,7 +435,7 @@ async function buildItem(
       markdown,
       extractionStatus: 'ok',
       displayPath,
-      rootFolderId: deps.root.rootFolderId,
+      rootFolderId: root.rootFolderId,
     };
   }
 
@@ -413,7 +444,7 @@ async function buildItem(
       return null;
     }
     if (Number(file.size ?? 0) > MAX_BINARY_BYTES) {
-      return metadataOnly(file, 'file', 'too-large', displayPath, deps.root.rootFolderId);
+      return metadataOnly(file, 'file', 'too-large', displayPath, root.rootFolderId);
     }
     const bytes = await deps.client.request<Uint8Array>(mediaUrl(file.id), {
       responseType: 'bytes',
@@ -421,7 +452,7 @@ async function buildItem(
     // Post-download cap: Drive binaries virtually always carry `size`, but
     // the cap is the guarantee — an unknown-size file must not slip past it.
     if (bytes.byteLength > MAX_BINARY_BYTES) {
-      return metadataOnly(file, 'file', 'too-large', displayPath, deps.root.rootFolderId);
+      return metadataOnly(file, 'file', 'too-large', displayPath, root.rootFolderId);
     }
     return {
       file,
@@ -430,15 +461,15 @@ async function buildItem(
       bytes,
       extractionStatus: 'ok',
       displayPath,
-      rootFolderId: deps.root.rootFolderId,
+      rootFolderId: root.rootFolderId,
     };
   }
 
-  return metadataOnly(file, 'file', 'unsupported', displayPath, deps.root.rootFolderId);
+  return metadataOnly(file, 'file', 'unsupported', displayPath, root.rootFolderId);
 }
 
 /**
- * BFS backfill from the configured root (v1 backfill.ts walkFolder). One
+ * BFS backfill across ALL configured roots (v1 backfill.ts walkFolder). One
  * batch per files.list page; the cursor stays `{ page_token, backfill_done:
  * false }` the whole walk — a crash at any boundary redoes the walk, which
  * is SAFE (idempotent upserts) and cheap (hash-skip). Ends with a final
@@ -449,7 +480,7 @@ async function* backfill(
   session: Session,
   query: Query,
   cursor: DriveCursor | null,
-  root: RootConfig,
+  roots: RootConfig[],
 ): AsyncGenerator<Batch<DriveCursor, DriveItem>> {
   // A non-empty saved page_token predates the interrupted walk — a superset
   // of the changes we might miss — so KEEP it; never recapture mid-backfill.
@@ -461,15 +492,19 @@ async function* backfill(
     pageToken = r.startPageToken;
   }
 
-  const deps: ItemDeps = { client, session, query, root };
+  const deps: ItemDeps = { client, session, query };
   const index: FolderIndex = new Map();
-  // BFS queue: folder id + its display-path segments below the root.
-  // `walked` bounds the walk against folder cycles / duplicate listings —
-  // impossible under Drive's single-parent model, so defense-in-depth only.
-  const walked = new Set<string>([root.rootFolderId]);
-  const queue: { folderId: string; segments: string[]; pageToken?: string }[] = [
-    { folderId: root.rootFolderId, segments: [] },
-  ];
+  // BFS queue: folder id + its display-path segments below its root, tagged
+  // with the RootConfig that owns the subtree. `walked` is ONE set SHARED
+  // across roots: an overlapping subtree (a tracked root nested inside
+  // another tracked root, or a folder cycle — the latter impossible under
+  // Drive's single-parent model) is listed and ingested exactly once. The
+  // FIRST root to reach a folder wins its displayPath/root attribution; a
+  // root nested inside another keeps its own subtree because every root is
+  // seeded before any listing happens.
+  const walked = new Set<string>(roots.map((r) => r.rootFolderId));
+  const queue: { folderId: string; segments: string[]; root: RootConfig; pageToken?: string }[] =
+    roots.map((r) => ({ folderId: r.rootFolderId, segments: [], root: r }));
 
   while (queue.length > 0) {
     if (session.signal.aborted) return;
@@ -485,12 +520,16 @@ async function* backfill(
         index.set(f.id, { name: f.name, parents: f.parents ?? [] });
         if (!walked.has(f.id)) {
           walked.add(f.id);
-          queue.push({ folderId: f.id, segments: [...head.segments, f.name] });
+          queue.push({
+            folderId: f.id,
+            segments: [...head.segments, f.name],
+            root: head.root,
+          });
         }
         continue;
       }
       try {
-        const item = await buildItem(f, head.segments, deps);
+        const item = await buildItem(f, head.segments, head.root, deps);
         if (item) items.push(item);
       } catch (e) {
         // One unreadable file must not abort the walk (v1 backfill parity).
@@ -513,29 +552,30 @@ async function* backfill(
   yield { phase: 'live', items: [], cursor: { page_token: pageToken, backfill_done: true } };
 }
 
-/** Walk ancestors from `file` up to `targetRootId` (≤64 hops, cycle-safe —
- *  v1 path-resolver simplified to a single root). Unknown ancestors are
- *  fetched shallow on demand and cached in the index. Returns the display
- *  segments (top-down, root excluded) when in scope.
+/** Walk ancestors from `file` until the chain reaches ANY tracked root id
+ *  (≤64 hops, cycle-safe — v1 path-resolver generalized to a root SET).
+ *  Unknown ancestors are fetched shallow on demand and cached in the index.
+ *  When in scope, returns the id of the root actually reached plus the
+ *  display segments (top-down, root excluded).
  *
  *  Simplified to the FIRST parent chain only — v1's path-resolver BFS'd
  *  every parent chain. Drive migrated multi-parent files to shortcuts in
  *  2020, so the exposure is a rare legacy tail: such a file whose first
- *  listed parent chain exits the root is treated as out of scope (archived
- *  on its next change; the next backfill/reconcile pass under the root
+ *  listed parent chain exits every root is treated as out of scope (archived
+ *  on its next change; the next backfill/reconcile pass under the roots
  *  restores it). */
 async function resolveScope(
   file: DriveFile,
-  targetRootId: string,
+  rootIds: Set<string>,
   index: FolderIndex,
   client: DriveClient,
-): Promise<{ inScope: boolean; segments: string[] }> {
+): Promise<{ inScope: boolean; rootId?: string; segments: string[] }> {
   const segments: string[] = [];
   const visited = new Set<string>();
   let current = file.parents?.[0];
   for (let hops = 0; hops < MAX_ANCESTOR_HOPS && current; hops++) {
-    if (current === targetRootId) {
-      return { inScope: true, segments: segments.reverse() };
+    if (rootIds.has(current)) {
+      return { inScope: true, rootId: current, segments: segments.reverse() };
     }
     if (visited.has(current)) break; // cycle
     visited.add(current);
@@ -583,18 +623,28 @@ async function* delta(
   session: Session,
   query: Query,
   cursor: DriveCursor,
-  root: RootConfig,
+  roots: RootConfig[],
 ): AsyncGenerator<Batch<DriveCursor, DriveItem>> {
-  const deps: ItemDeps = { client, session, query, root };
+  const deps: ItemDeps = { client, session, query };
   const index: FolderIndex = new Map();
 
-  // When indexing all of My Drive, ancestor walks must match the REAL root
-  // folder id ('root' is only an API alias) — resolved once per run.
-  let targetRootId = root.rootFolderId;
-  if (targetRootId === 'root') {
-    const r = await client.request<{ id: string }>(`${DRIVE_API}/files/root?fields=id`);
-    targetRootId = r.id;
+  // Ancestor walks must match REAL folder ids — 'root' is only an API alias,
+  // resolved ONCE per run (rootsConfig deduped ids, so at most one 'root'
+  // entry exists). A file is in scope iff its chain reaches ANY tracked
+  // root; attribution (displayPath/rootFolderId) comes from the root
+  // actually reached. First config to claim a resolved id wins — an explicit
+  // real My-Drive id alongside the 'root' alias collapses to one entry,
+  // mirroring backfill's first-root-wins attribution.
+  const byRootId = new Map<string, RootConfig>();
+  for (const root of roots) {
+    let id = root.rootFolderId;
+    if (id === 'root') {
+      const r = await client.request<{ id: string }>(`${DRIVE_API}/files/root?fields=id`);
+      id = r.id;
+    }
+    if (!byRootId.has(id)) byRootId.set(id, root);
   }
+  const rootIds = new Set(byRootId.keys());
 
   let pageToken = cursor.page_token;
   for (;;) {
@@ -644,13 +694,18 @@ async function* delta(
           index.set(c.file.id, { name: c.file.name, parents: c.file.parents ?? [] });
           continue;
         }
-        const scope = await resolveScope(c.file, targetRootId, index, client);
+        const scope = await resolveScope(c.file, rootIds, index, client);
         if (!scope.inScope) {
-          // Moved out of the indexed subtree: archive whatever exists locally.
+          // Moved out of every indexed subtree: archive whatever exists locally.
           deletions.push(...(await existingRefs(query, session, c.fileId)));
           continue;
         }
-        const item = await buildItem(c.file, scope.segments, deps);
+        const item = await buildItem(
+          c.file,
+          scope.segments,
+          byRootId.get(scope.rootId!)!,
+          deps,
+        );
         if (item) items.push(item);
       } catch (e) {
         // Per-file guard — the v1-bug-3 fix: one bad file never aborts the
@@ -742,11 +797,11 @@ export function createGoogleDocsSource(
 
     async *pull(session: Session, cursor: DriveCursor | null) {
       const client = clientFor(session);
-      const root = rootConfig(session);
+      const roots = rootsConfig(session);
       if (!cursor || !cursor.backfill_done) {
-        yield* backfill(client, session, host.query, cursor, root);
+        yield* backfill(client, session, host.query, cursor, roots);
       } else {
-        yield* delta(client, session, host.query, cursor, root);
+        yield* delta(client, session, host.query, cursor, roots);
       }
     },
 
@@ -817,19 +872,20 @@ export function createGoogleDocsSource(
     },
 
     /**
-     * Full BFS listing of what exists under the root. Refs carry the type
-     * the ROUTING would emit (native docs → 'gdocs.doc', everything else →
-     * 'file'; shortcuts → the TARGET id, matching ingest). ANY listing
+     * Full BFS listing of what exists under ALL configured roots. Refs carry
+     * the type the ROUTING would emit (native docs → 'gdocs.doc', everything
+     * else → 'file'; shortcuts → the TARGET id, matching ingest). ANY listing
      * failure THROWS — the engine treats a thrown reconcile as a partial
      * listing and skips the deletion diff; yielding a partial live-set would
      * mass-archive documents.
      */
     async *reconcile(session: Session): AsyncIterable<ExternalRef[]> {
       const client = clientFor(session);
-      const root = rootConfig(session);
-      // Cycle/duplicate guard, same rationale as backfill's `walked` set.
-      const walked = new Set<string>([root.rootFolderId]);
-      const queue: string[] = [root.rootFolderId];
+      const roots = rootsConfig(session);
+      // ONE walked set shared across roots — overlapping subtrees listed
+      // once, same rationale as backfill's `walked` (cycle guard included).
+      const walked = new Set<string>(roots.map((r) => r.rootFolderId));
+      const queue: string[] = roots.map((r) => r.rootFolderId);
       while (queue.length > 0) {
         if (session.signal.aborted) return;
         const folderId = queue.shift()!;

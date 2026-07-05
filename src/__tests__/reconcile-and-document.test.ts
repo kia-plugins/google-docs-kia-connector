@@ -67,6 +67,54 @@ describe('reconcile', () => {
     expect(calls.some((u) => u.includes('/files/TD1'))).toBe(false);
   });
 
+  it('multi-root: lists every root; an overlapping subtree (root inside root) is listed once', async () => {
+    const { source, calls } = makeSource({
+      lists: {
+        FA: [gdoc('a1', 'A doc', { parents: ['FA'] }), folder('FB', 'B Folder', { parents: ['FA'] })],
+        FB: [gdoc('b1', 'B doc', { parents: ['FB'] })],
+      },
+    });
+    const { session } = makeSession({
+      config: {
+        roots: [
+          { rootFolderId: 'FA', rootName: 'Alpha' },
+          { rootFolderId: 'FB', rootName: 'Beta' },
+        ],
+      },
+    });
+
+    const pages = await collect(source.reconcile!(session));
+
+    expect(pages).toEqual([
+      [{ externalId: 'a1', type: 'gdocs.doc' }],
+      [{ externalId: 'b1', type: 'gdocs.doc' }],
+    ]);
+    expect(
+      calls.filter((u) => (new URL(u).searchParams.get('q') ?? '').includes("'FB' in parents")),
+    ).toHaveLength(1);
+  });
+
+  it("multi-root: THROWS when the second root's listing fails (partial must not read as complete)", async () => {
+    const { source } = makeSource({
+      lists: { FA: [gdoc('a1', 'A doc', { parents: ['FA'] })] },
+      custom: (url) =>
+        url.pathname === '/drive/v3/files' &&
+        (url.searchParams.get('q') ?? '').includes("'FB'")
+          ? jsonRes(500, { error: { message: 'Backend Error' } })
+          : undefined,
+    });
+    const { session } = makeSession({
+      config: {
+        roots: [
+          { rootFolderId: 'FA', rootName: 'Alpha' },
+          { rootFolderId: 'FB', rootName: 'Beta' },
+        ],
+      },
+    });
+
+    await expect(collect(source.reconcile!(session))).rejects.toThrow(/drive 500/);
+  });
+
   it('THROWS on any listing failure instead of yielding a partial live-set', async () => {
     const { source } = makeSource({
       lists: { root: [gdoc('docA', 'Doc A'), folder('S', 'Sub')] },
