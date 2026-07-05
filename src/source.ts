@@ -29,6 +29,8 @@ import type {
   Document,
   DocumentInput,
   ExternalRef,
+  FolderCount,
+  FolderNode,
   HostFor,
   Query,
   Session,
@@ -130,6 +132,122 @@ export function parseRootInput(raw: string): string {
   const idParam = /[?&]id=([A-Za-z0-9_-]+)/.exec(t);
   if (idParam) return idParam[1];
   return t;
+}
+
+// ── Folder-picker callbacks (connect-time UI) ───────────────────────────────
+// Invoked lazily by the platform's shared picker while it is open.
+
+/** Picker listing page size — folder-only rows are cheap. */
+const PICKER_PAGE_SIZE = 200;
+/** Silent cap on one picker listing (a tab's roots / one folder's children). */
+const PICKER_MAX_FOLDERS = 1000;
+/** countFilesUnder: at most this many files.list PAGES per counted folder. */
+const COUNT_BUDGET_REQUESTS = 20;
+/** countFilesUnder file cap — matches the local-folder source's 50k cap. */
+const COUNT_CAP = 50_000;
+
+/** Drive ids are [A-Za-z0-9_-], so this is defense-in-depth only. */
+const escapeDriveId = (id: string): string => id.replace(/'/g, "\\'");
+
+interface PickerListPage {
+  files?: { id: string; name: string }[];
+  nextPageToken?: string;
+}
+
+function pickerListUrl(q: string, pageToken?: string): string {
+  const url = new URL(`${DRIVE_API}/files`);
+  url.searchParams.set('q', q);
+  url.searchParams.set('orderBy', 'name');
+  url.searchParams.set('fields', 'files(id,name),nextPageToken');
+  url.searchParams.set('pageSize', String(PICKER_PAGE_SIZE));
+  if (pageToken) url.searchParams.set('pageToken', pageToken);
+  return url.toString();
+}
+
+/** `hasChildren` is ALWAYS true: probing real child existence would cost one
+ *  API call per row, so an expand that turns out empty is accepted instead
+ *  (see README). Stops silently at PICKER_MAX_FOLDERS. */
+async function listFolderNodes(client: DriveClient, q: string): Promise<FolderNode[]> {
+  const nodes: FolderNode[] = [];
+  let pageToken: string | undefined;
+  do {
+    const page = await client.request<PickerListPage>(pickerListUrl(q, pageToken));
+    for (const f of page.files ?? []) {
+      nodes.push({ id: f.id, name: f.name, hasChildren: true });
+      if (nodes.length >= PICKER_MAX_FOLDERS) return nodes;
+    }
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+  return nodes;
+}
+
+/** Roots of the picker's "Shared with me" tab. */
+export const listSharedRoots = (client: DriveClient): Promise<FolderNode[]> =>
+  listFolderNodes(
+    client,
+    `sharedWithMe = true and mimeType = '${GOOGLE_FOLDER_MIME}' and trashed = false`,
+  );
+
+/** Child FOLDERS of one picker row. */
+export const listChildFolders = (client: DriveClient, id: string): Promise<FolderNode[]> =>
+  listFolderNodes(
+    client,
+    `'${escapeDriveId(id)}' in parents and mimeType = '${GOOGLE_FOLDER_MIME}' and trashed = false`,
+  );
+
+interface CountListPage {
+  files?: { id: string; mimeType: string }[];
+  nextPageToken?: string;
+}
+
+function countListUrl(folderId: string, pageToken?: string): string {
+  const url = new URL(`${DRIVE_API}/files`);
+  url.searchParams.set('q', `'${escapeDriveId(folderId)}' in parents and trashed = false`);
+  url.searchParams.set('fields', 'files(id,mimeType),nextPageToken');
+  url.searchParams.set('pageSize', '1000');
+  if (pageToken) url.searchParams.set('pageToken', pageToken);
+  return url.toString();
+}
+
+/**
+ * Budgeted recursive BFS file count behind the picker's per-row "N files".
+ * Each files.list PAGE spends one request of the budget; non-folders count
+ * (shortcuts too — an estimate, targets are not resolved), folders enqueue.
+ * Exiting with work remaining (budget spent or CAP reached, including a
+ * dangling nextPageToken) → `capped: true`, count is a lower bound. Any Drive
+ * error resolves `null` (uncounted row) — a count must never kill the picker.
+ */
+export async function countFilesUnder(
+  client: DriveClient,
+  id: string,
+): Promise<FolderCount | null> {
+  try {
+    const queue: string[] = [id];
+    let counted = 0;
+    let requests = 0;
+    while (queue.length > 0) {
+      const folderId = queue.shift()!;
+      let pageToken: string | undefined;
+      do {
+        // Checked before the fetch: reaching the limit HERE means this
+        // folder (or its next page) is still unlisted → the walk is partial.
+        if (requests >= COUNT_BUDGET_REQUESTS) return { count: counted, capped: true };
+        requests++;
+        const page = await client.request<CountListPage>(countListUrl(folderId, pageToken));
+        for (const f of page.files ?? []) {
+          if (f.mimeType === GOOGLE_FOLDER_MIME) {
+            queue.push(f.id);
+          } else if (++counted >= COUNT_CAP) {
+            return { count: counted, capped: true };
+          }
+        }
+        pageToken = page.nextPageToken;
+      } while (pageToken);
+    }
+    return { count: counted, capped: false };
+  } catch {
+    return null;
+  }
 }
 
 function rootConfig(session: Session): RootConfig {

@@ -78,8 +78,13 @@ export interface DriveWorld {
   /** files/root?fields=id — the REAL id behind the 'root' alias. */
   rootId?: string;
   /** folderId → one page (flat array) or explicit pages (array of arrays).
-   *  Pagination tokens are synthesized as `<folderId>@<pageIndex>`. */
+   *  Pagination tokens are synthesized as `<folderId>@<pageIndex>`. Serves
+   *  the ingest listing, the picker's children query (folders only), and the
+   *  picker's count query. */
   lists?: Record<string, DriveFile[] | DriveFile[][]>;
+  /** sharedWithMe folder listing for the picker's Shared-with-me tab; same
+   *  page shape as `lists`, tokens synthesized as `shared@<pageIndex>`. */
+  sharedRoots?: DriveFile[] | DriveFile[][];
   /** changes.list pages keyed by the requesting pageToken. */
   changes?: Record<string, ChangesPageFx>;
   /** pageTokens that respond 400 "page token is invalid". */
@@ -139,18 +144,44 @@ export function driveFetch(world: DriveWorld = {}): {
     }
     if (p === '/drive/v3/files') {
       const q = url.searchParams.get('q') ?? '';
-      const m = /^'(.+)' in parents and trashed=false$/.exec(q);
+      const tok = url.searchParams.get('pageToken');
+      const paginate = (key: string, raw: DriveFile[] | DriveFile[][]) => {
+        const pages: DriveFile[][] = Array.isArray(raw[0])
+          ? (raw as DriveFile[][])
+          : [raw as DriveFile[]];
+        const idx = tok ? Number(tok.split('@')[1]) : 0;
+        const body: { files?: DriveFile[]; nextPageToken?: string } = {
+          files: pages[idx] ?? [],
+        };
+        if (idx + 1 < pages.length) body.nextPageToken = `${key}@${idx + 1}`;
+        return jsonRes(200, body);
+      };
+      // Picker: shared-with-me folder roots.
+      if (q.startsWith('sharedWithMe = true')) {
+        return paginate('shared', world.sharedRoots ?? []);
+      }
+      // Ingest listing (`trashed=false`), picker children (folder-mime
+      // clause), and picker count (`trashed = false`) all serve from
+      // world.lists; the children query filters to folders.
+      const m =
+        /^'(.+)' in parents and (?:mimeType = 'application\/vnd\.google-apps\.folder' and )?trashed ?= ?false$/.exec(
+          q,
+        );
       const folderId = m?.[1] ?? '';
       const raw = world.lists?.[folderId];
       if (raw === undefined) throw new Error(`fake drive: no listing for folder ${folderId}`);
-      const pages: DriveFile[][] = Array.isArray(raw[0])
-        ? (raw as DriveFile[][])
-        : [raw as DriveFile[]];
-      const tok = url.searchParams.get('pageToken');
-      const idx = tok ? Number(tok.split('@')[1]) : 0;
-      const body: ChangesPageFx & { files?: DriveFile[] } = { files: pages[idx] ?? [] };
-      if (idx + 1 < pages.length) body.nextPageToken = `${folderId}@${idx + 1}`;
-      return jsonRes(200, body);
+      const res = paginate(folderId, raw);
+      if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+        const body = JSON.parse(new TextDecoder().decode(res.body)) as {
+          files?: DriveFile[];
+          nextPageToken?: string;
+        };
+        body.files = (body.files ?? []).filter(
+          (f) => f.mimeType === 'application/vnd.google-apps.folder',
+        );
+        return jsonRes(200, body);
+      }
+      return res;
     }
     if (p === '/drive/v3/files/root') {
       return jsonRes(200, { id: world.rootId ?? 'MYDRIVE' });
