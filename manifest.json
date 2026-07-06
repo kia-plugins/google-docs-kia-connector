@@ -1,9 +1,20 @@
 {
   "id": "kia.google-docs",
   "name": "Google Docs",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "engine": "^1.0.0",
   "entry": "dist/index.js",
-  "caps": ["net", "query"],
-  "contributes": { "sources": [{ "id": "google-docs", "oauth": "google" }] }
+  "caps": [
+    "net",
+    "query"
+  ],
+  "contributes": {
+    "sources": [
+      {
+        "id": "google-docs",
+        "oauth": "google"
+      }
+    ]
+  },
+  "icon": "icon.png"
 }

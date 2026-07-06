@@ -1,12 +1,13 @@
 {
   "name": "google-docs-kia-connector",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "description": "Google Docs / Drive connector for KIAgent (new extension platform)",
   "files": [
     "manifest.json",
     "dist",
-    "README.md"
+    "README.md",
+    "icon.png"
   ],
   "scripts": {
     "build": "node build.mjs",
