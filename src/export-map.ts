@@ -1,5 +1,5 @@
 /**
- * v2 port of v1 export-map.ts (alpha-cent `git show
+ * v2 port of v1 export-map.ts (v1 repo `git show
  * main:src/main/connectors/google-docs/export-map.ts`).
  *
  * Route shape is v1's; two v2 deltas:

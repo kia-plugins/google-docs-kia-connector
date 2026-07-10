@@ -5,7 +5,7 @@
  * full-listing reconcile, fetchBytes for the engine's deep-extraction
  * passes, and a pure toDocument.
  *
- * Ported from alpha-cent's v1 connector (`git show
+ * Ported from the v1 connector (`git show
  * main:src/main/connectors/google-docs/<file>.ts`): backfill.ts's walkFolder
  * BFS, delta.ts's changes loop + invalid-token recovery, ingest.ts's routing
  * / shortcut resolution / hash-skip, path-resolver.ts's ancestor walk

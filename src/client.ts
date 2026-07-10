@@ -1,5 +1,5 @@
 /**
- * v2 port of the v1 Drive client (alpha-cent `git show
+ * v2 port of the v1 Drive client (v1 repo `git show
  * main:src/main/connectors/google-docs/client.ts` +
  * `main:src/main/connectors/http-shared/bearer-fetch.ts`).
  *
