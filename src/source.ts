@@ -37,7 +37,7 @@ import type {
   Query,
   Session,
   Source,
-} from './kiagent-contracts';
+} from '@kiagent/connector-sdk';
 import {
   DriveApiError,
   DriveClient,

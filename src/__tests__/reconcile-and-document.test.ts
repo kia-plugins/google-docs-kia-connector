@@ -8,7 +8,7 @@ import {
   type DriveItem,
 } from '../source';
 import { DriveApiError } from '../client';
-import type { DocumentInput } from '../kiagent-contracts';
+import type { DocumentInput } from '@kiagent/connector-sdk';
 import {
   collect,
   driveFetch,

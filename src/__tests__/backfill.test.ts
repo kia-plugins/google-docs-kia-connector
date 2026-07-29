@@ -11,7 +11,7 @@ import {
   type DriveItem,
 } from '../source';
 import { GoogleDocsAuthError } from '../client';
-import type { Batch } from '../kiagent-contracts';
+import type { Batch } from '@kiagent/connector-sdk';
 import {
   collect,
   driveFetch,
