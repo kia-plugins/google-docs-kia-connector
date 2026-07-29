@@ -9,11 +9,12 @@
  * default host carries `net` only.
  */
 import { join } from 'node:path';
-import type { HostFor, Query } from '@kiagent/connector-sdk';
+import type { HostFor, Query, Source } from '@kiagent/connector-sdk';
 import { bundleLoadSmoke } from '@kiagent/connector-sdk/testing';
 
 describe('dist bundle loads standalone', () => {
   it('require()s dist/index.js and activate() returns the google-docs source', async () => {
+    const root = join(__dirname, '..', '..');
     const unused = () => {
       throw new Error('unused in this smoke test');
     };
@@ -32,10 +33,21 @@ describe('dist bundle loads standalone', () => {
     };
 
     await bundleLoadSmoke({
-      root: join(__dirname, '..', '..'),
+      root,
       selfId: 'kia.google-docs',
       sourceIds: ['google-docs'],
       host,
     });
+
+    // `bundleLoadSmoke` covers the build, the require, and the contributed
+    // source ids, but never returns the activate() result — so the descriptor
+    // check the smoke has always carried is re-asserted here. The bundle is
+    // already built and require-cached by the call above, and activate() only
+    // closes over the host, so re-activating costs nothing.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require(join(root, 'dist', 'index.js'));
+    const entry = mod.default ?? mod;
+    const result = (await entry.activate(host)) as { sources?: Source[] };
+    expect(result.sources?.[0]?.descriptor.auth).toBe('oauth');
   }, 30_000);
 });
