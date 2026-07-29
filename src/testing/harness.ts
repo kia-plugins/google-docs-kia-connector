@@ -1,15 +1,18 @@
 /**
- * Shared offline test harness: scripted host-shaped fetch responses (status /
- * statusText / lowercase headers / body: Uint8Array — see src/client.ts), a
- * fake Drive world router keyed by endpoint, and fakes for Session /
- * AuthChannel / Query. No network, no timers (client sleep/random are
- * injected as instant/zero by the tests).
+ * Google-Docs-specific test harness: a fake Drive world router keyed by
+ * endpoint, a Query fake, and Drive file fixtures.
+ *
+ * The GENERIC plumbing — host-shaped JSON responses, the scripted-fetch
+ * skeleton (call log + per-URL counts + custom-first hook), the instant clock,
+ * and the Session / AuthChannel fakes — comes from
+ * `@kiagent/connector-sdk/testing`; only what knows about Drive lives here.
+ * `jsonRes` / `instantClock` / `HostResponse` are re-exported so the suites
+ * keep importing everything from this one module.
  *
  * Lives outside src/__tests__ so jest's default testMatch does not treat it
  * as a suite. Never bundled: build.mjs only follows imports from index.ts.
  */
 import type {
-  Account,
   AuthChannel,
   Credentials,
   Document,
@@ -19,26 +22,20 @@ import type {
   Query,
   Session,
 } from '@kiagent/connector-sdk';
+import type { HostResponse } from '@kiagent/connector-sdk/http';
+import {
+  fakeAuthChannel,
+  fakeSession,
+  instantClock,
+  jsonRes,
+  scriptedFetch,
+} from '@kiagent/connector-sdk/testing';
 import type { NetFetch } from '../client';
 import type { DriveFile } from '../source';
 
-export interface HostResponse {
-  status: number;
-  statusText: string;
-  headers: Record<string, string>;
-  body: Uint8Array;
-}
-
-export const jsonRes = (
-  status: number,
-  body: unknown,
-  headers: Record<string, string> = {},
-): HostResponse => ({
-  status,
-  statusText: '',
-  headers,
-  body: new TextEncoder().encode(JSON.stringify(body)),
-});
+export type { HostResponse };
+/** `instantClock` = instant sleep + zero jitter for the source/client seam. */
+export { instantClock, jsonRes };
 
 export const textRes = (
   status: number,
@@ -104,114 +101,107 @@ export interface DriveWorld {
   custom?: (url: URL, count: number) => HostResponse | undefined;
 }
 
+/** Routes ONE Drive request against the world tables. A missing fixture
+ *  throws by design — see DriveWorld. */
+function routeDrive(url: URL, world: DriveWorld): HostResponse {
+  const p = url.pathname;
+  if (p === '/drive/v3/changes/startPageToken') {
+    return jsonRes(200, { startPageToken: world.startPageToken ?? 'spt-1' });
+  }
+  if (p === '/drive/v3/about') {
+    return jsonRes(200, {
+      user: world.about ?? { emailAddress: 'user@example.com', displayName: 'User' },
+    });
+  }
+  if (p === '/drive/v3/changes') {
+    const tok = url.searchParams.get('pageToken') ?? '';
+    if (world.changesInvalid?.includes(tok)) {
+      return jsonRes(400, {
+        error: { code: 400, message: 'Invalid Value — page token is invalid.' },
+      });
+    }
+    const page = world.changes?.[tok];
+    if (!page) throw new Error(`fake drive: no changes page for token ${tok}`);
+    return jsonRes(200, page);
+  }
+  if (p === '/drive/v3/files') {
+    const q = url.searchParams.get('q') ?? '';
+    const tok = url.searchParams.get('pageToken');
+    const paginate = (key: string, raw: DriveFile[] | DriveFile[][]) => {
+      const pages: DriveFile[][] = Array.isArray(raw[0])
+        ? (raw as DriveFile[][])
+        : [raw as DriveFile[]];
+      const idx = tok ? Number(tok.split('@')[1]) : 0;
+      const body: { files?: DriveFile[]; nextPageToken?: string } = {
+        files: pages[idx] ?? [],
+      };
+      if (idx + 1 < pages.length) body.nextPageToken = `${key}@${idx + 1}`;
+      return jsonRes(200, body);
+    };
+    // Picker: shared-with-me folder roots.
+    if (q.startsWith('sharedWithMe = true')) {
+      return paginate('shared', world.sharedRoots ?? []);
+    }
+    // Ingest listing (`trashed=false`), picker children (folder-mime
+    // clause), and picker count (`trashed = false`) all serve from
+    // world.lists; the children query filters to folders.
+    const m =
+      /^'(.+)' in parents and (?:mimeType = 'application\/vnd\.google-apps\.folder' and )?trashed ?= ?false$/.exec(
+        q,
+      );
+    const folderId = m?.[1] ?? '';
+    const raw = world.lists?.[folderId];
+    if (raw === undefined) throw new Error(`fake drive: no listing for folder ${folderId}`);
+    const res = paginate(folderId, raw);
+    if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
+      const body = JSON.parse(new TextDecoder().decode(res.body)) as {
+        files?: DriveFile[];
+        nextPageToken?: string;
+      };
+      body.files = (body.files ?? []).filter(
+        (f) => f.mimeType === 'application/vnd.google-apps.folder',
+      );
+      return jsonRes(200, body);
+    }
+    return res;
+  }
+  if (p === '/drive/v3/files/root') {
+    return jsonRes(200, { id: world.rootId ?? 'MYDRIVE' });
+  }
+  const exp = /^\/drive\/v3\/files\/([^/]+)\/export$/.exec(p);
+  if (exp) {
+    const mime = url.searchParams.get('mimeType');
+    const table = mime === 'text/markdown' ? world.exportsMd : world.exportsPlain;
+    const v = table?.[exp[1]];
+    if (v === undefined) throw new Error(`fake drive: no ${mime} export for ${exp[1]}`);
+    return typeof v === 'string' ? textRes(200, v) : v;
+  }
+  const fileM = /^\/drive\/v3\/files\/([^/]+)$/.exec(p);
+  if (fileM) {
+    if (url.searchParams.get('alt') === 'media') {
+      const v = world.media?.[fileM[1]];
+      if (v === undefined) throw new Error(`fake drive: no media for ${fileM[1]}`);
+      return v instanceof Uint8Array ? bytesRes(200, v) : v;
+    }
+    const v = world.gets?.[fileM[1]];
+    if (v === undefined) throw new Error(`fake drive: no file get for ${fileM[1]}`);
+    return isHostResponse(v) ? v : jsonRes(200, v);
+  }
+  throw new Error(`fake drive: unhandled url ${url.href}`);
+}
+
+/** A Drive-shaped `scriptedFetch`: the SDK kit owns the call log and the
+ *  per-URL counters, `routeDrive` owns the endpoints. `world.custom` still
+ *  wins over the world tables. */
 export function driveFetch(world: DriveWorld = {}): {
   fetchFn: NetFetch;
   calls: string[];
 } {
-  const calls: string[] = [];
-  const counts = new Map<string, number>();
-  const fetchFn: NetFetch = async (rawUrl) => {
-    const urlStr = String(rawUrl);
-    calls.push(urlStr);
-    const count = counts.get(urlStr) ?? 0;
-    counts.set(urlStr, count + 1);
-    const url = new URL(urlStr);
-
-    if (world.custom) {
-      const r = world.custom(url, count);
-      if (r) return r;
-    }
-
-    const p = url.pathname;
-    if (p === '/drive/v3/changes/startPageToken') {
-      return jsonRes(200, { startPageToken: world.startPageToken ?? 'spt-1' });
-    }
-    if (p === '/drive/v3/about') {
-      return jsonRes(200, {
-        user: world.about ?? { emailAddress: 'user@example.com', displayName: 'User' },
-      });
-    }
-    if (p === '/drive/v3/changes') {
-      const tok = url.searchParams.get('pageToken') ?? '';
-      if (world.changesInvalid?.includes(tok)) {
-        return jsonRes(400, {
-          error: { code: 400, message: 'Invalid Value — page token is invalid.' },
-        });
-      }
-      const page = world.changes?.[tok];
-      if (!page) throw new Error(`fake drive: no changes page for token ${tok}`);
-      return jsonRes(200, page);
-    }
-    if (p === '/drive/v3/files') {
-      const q = url.searchParams.get('q') ?? '';
-      const tok = url.searchParams.get('pageToken');
-      const paginate = (key: string, raw: DriveFile[] | DriveFile[][]) => {
-        const pages: DriveFile[][] = Array.isArray(raw[0])
-          ? (raw as DriveFile[][])
-          : [raw as DriveFile[]];
-        const idx = tok ? Number(tok.split('@')[1]) : 0;
-        const body: { files?: DriveFile[]; nextPageToken?: string } = {
-          files: pages[idx] ?? [],
-        };
-        if (idx + 1 < pages.length) body.nextPageToken = `${key}@${idx + 1}`;
-        return jsonRes(200, body);
-      };
-      // Picker: shared-with-me folder roots.
-      if (q.startsWith('sharedWithMe = true')) {
-        return paginate('shared', world.sharedRoots ?? []);
-      }
-      // Ingest listing (`trashed=false`), picker children (folder-mime
-      // clause), and picker count (`trashed = false`) all serve from
-      // world.lists; the children query filters to folders.
-      const m =
-        /^'(.+)' in parents and (?:mimeType = 'application\/vnd\.google-apps\.folder' and )?trashed ?= ?false$/.exec(
-          q,
-        );
-      const folderId = m?.[1] ?? '';
-      const raw = world.lists?.[folderId];
-      if (raw === undefined) throw new Error(`fake drive: no listing for folder ${folderId}`);
-      const res = paginate(folderId, raw);
-      if (q.includes("mimeType = 'application/vnd.google-apps.folder'")) {
-        const body = JSON.parse(new TextDecoder().decode(res.body)) as {
-          files?: DriveFile[];
-          nextPageToken?: string;
-        };
-        body.files = (body.files ?? []).filter(
-          (f) => f.mimeType === 'application/vnd.google-apps.folder',
-        );
-        return jsonRes(200, body);
-      }
-      return res;
-    }
-    if (p === '/drive/v3/files/root') {
-      return jsonRes(200, { id: world.rootId ?? 'MYDRIVE' });
-    }
-    const exp = /^\/drive\/v3\/files\/([^/]+)\/export$/.exec(p);
-    if (exp) {
-      const mime = url.searchParams.get('mimeType');
-      const table = mime === 'text/markdown' ? world.exportsMd : world.exportsPlain;
-      const v = table?.[exp[1]];
-      if (v === undefined) throw new Error(`fake drive: no ${mime} export for ${exp[1]}`);
-      return typeof v === 'string' ? textRes(200, v) : v;
-    }
-    const fileM = /^\/drive\/v3\/files\/([^/]+)$/.exec(p);
-    if (fileM) {
-      if (url.searchParams.get('alt') === 'media') {
-        const v = world.media?.[fileM[1]];
-        if (v === undefined) throw new Error(`fake drive: no media for ${fileM[1]}`);
-        return v instanceof Uint8Array ? bytesRes(200, v) : v;
-      }
-      const v = world.gets?.[fileM[1]];
-      if (v === undefined) throw new Error(`fake drive: no file get for ${fileM[1]}`);
-      return isHostResponse(v) ? v : jsonRes(200, v);
-    }
-    throw new Error(`fake drive: unhandled url ${urlStr}`);
-  };
+  const { fetchFn, calls } = scriptedFetch({
+    custom: (url, count) => world.custom?.(url, count) ?? routeDrive(url, world),
+  });
   return { fetchFn, calls };
 }
-
-/** Instant clock + zero jitter for the source/client test seam. */
-export const instantClock = { sleep: async () => {}, random: () => 0 };
 
 export function fakeQuery(docs: Document[] = []): Query & {
   byExternalIdCalls: Array<{ account: string; externalId: string; type: string }>;
@@ -247,6 +237,9 @@ export function makeHost(fetchFn: NetFetch, query: Query = fakeQuery()): HostFor
   };
 }
 
+/** The kit's `fakeSession` carrying this connector's account identity, with
+ *  the `{ level, msg }` log records the suites assert on (the kit collects
+ *  `[level, msg]` tuples). */
 export function makeSession(
   opts: {
     creds?: Credentials | null;
@@ -255,24 +248,27 @@ export function makeSession(
   } = {},
 ): { session: Session; logs: { level: string; msg: string }[] } {
   const logs: { level: string; msg: string }[] = [];
-  const session: Session = {
+  const base = fakeSession({
     account: {
       id: 'acc-1',
       source: 'google-docs',
       identifier: 'user@example.com',
       config: opts.config ?? {},
-      status: 'live',
       cursor: null,
-      createdAt: '2026-01-01T00:00:00Z',
-    } as Account,
-    signal: opts.signal ?? new AbortController().signal,
-    credentials: async () =>
-      opts.creds === undefined ? { accessToken: 'ya29.test-deadbeef' } : opts.creds,
+    },
+    credentials: opts.creds === undefined ? { accessToken: 'ya29.test-deadbeef' } : opts.creds,
+    signal: opts.signal,
+  });
+  const session: Session = {
+    ...base,
     log: (level, msg) => logs.push({ level, msg }),
   };
   return { session, logs };
 }
 
+/** The kit's `fakeAuthChannel` with every verb scripted to a Google-Docs
+ *  default (the kit's own defaults reject) plus recorders for what connect()
+ *  asked each verb for. */
 export function makeAuth(
   opts: {
     creds?: Credentials;
@@ -288,16 +284,14 @@ export function makeAuth(
   getSchema: () => unknown;
   getPickerSpec: () => FolderPickerSpec | undefined;
 } {
-  const statuses: string[] = [];
   let scopes: string[] | undefined;
   let schema: unknown;
   let pickerSpec: FolderPickerSpec | undefined;
-  const auth: AuthChannel = {
+  const auth = fakeAuthChannel({
     oauth: async (s) => {
       scopes = s;
       return opts.creds ?? { accessToken: 'ya29.test-deadbeef' };
     },
-    showQr: () => {},
     prompt: async (s) => {
       schema = s;
       return opts.answers ?? {};
@@ -307,11 +301,10 @@ export function makeAuth(
       if (typeof opts.picked === 'function') return opts.picked(spec);
       return opts.picked ?? [{ id: 'root', name: 'My Drive', hasChildren: true }];
     },
-    status: (m) => statuses.push(m),
-  };
+  });
   return {
     auth,
-    statuses,
+    statuses: auth.statuses,
     getScopes: () => scopes,
     getSchema: () => schema,
     getPickerSpec: () => pickerSpec,
