@@ -259,8 +259,13 @@ export function makeSession(
     credentials: opts.creds === undefined ? { accessToken: 'ya29.test-deadbeef' } : opts.creds,
     signal: opts.signal,
   });
+  // Field-by-field, NOT a spread: the kit's session also carries its own
+  // `logs` tuple array, and spreading would hang that always-empty array off
+  // the returned session where it would silently shadow the real one.
   const session: Session = {
-    ...base,
+    account: base.account,
+    signal: base.signal,
+    credentials: base.credentials,
     log: (level, msg) => logs.push({ level, msg }),
   };
   return { session, logs };
