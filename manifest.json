@@ -1,7 +1,7 @@
 {
   "id": "kia.google-docs",
   "name": "Google Docs",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "engine": "^1.0.0",
   "entry": "dist/index.js",
   "caps": [
