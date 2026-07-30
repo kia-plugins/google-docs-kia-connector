@@ -240,17 +240,12 @@ export async function countFilesUnder(
   }
 }
 
-/** Normalize account config to the tracked roots. Accepts the v2.1.0
- *  multi-root shape (`roots: [{ rootFolderId, rootName }]`), the legacy
- *  v2.0.0 single-root fields (`rootFolderId`/`rootName`), or nothing (all of
- *  My Drive). Per-entry name fallback: 'My Drive' for the 'root' alias, the
+/** Normalize account config to the tracked roots. Accepts the multi-root
+ *  shape (`roots: [{ rootFolderId, rootName }]`) or nothing (all of My
+ *  Drive). Per-entry name fallback: 'My Drive' for the 'root' alias, the
  *  id otherwise. Deduped by rootFolderId — first entry wins. */
 export function rootsConfig(session: Session): RootConfig[] {
-  const cfg = session.account.config as {
-    roots?: unknown;
-    rootFolderId?: unknown;
-    rootName?: unknown;
-  };
+  const cfg = session.account.config as { roots?: unknown };
   const nameFor = (id: string, name: unknown): string => {
     if (typeof name === 'string' && name) return name;
     return id === 'root' ? 'My Drive' : id;
@@ -269,10 +264,8 @@ export function rootsConfig(session: Session): RootConfig[] {
     }
   }
   if (parsed.length === 0) {
-    // Legacy v2.0.0 single-root config; no config at all → My Drive.
-    const id =
-      typeof cfg.rootFolderId === 'string' && cfg.rootFolderId ? cfg.rootFolderId : 'root';
-    parsed.push({ rootFolderId: id, rootName: nameFor(id, cfg.rootName) });
+    // No (or empty) config → all of My Drive.
+    parsed.push({ rootFolderId: 'root', rootName: 'My Drive' });
   }
 
   const seen = new Set<string>();

@@ -47,13 +47,10 @@ The picker writes the account config as
 ```
 
 with one entry per selected folder (`"root"` is Drive's alias for My Drive).
-Accounts connected with v2.0.0 keep working unchanged: the legacy
-single-root config `{ "rootFolderId": "...", "rootName": "..." }` is
-normalized to a one-entry roots list on every sync (missing `rootName` falls
-back to "My Drive" for `root`, the raw id otherwise), and an account with no
-root config at all still means all of My Drive. Duplicate root ids are
-ignored (first entry wins). If one tracked root lies inside another, the
-overlapping subtree is indexed once — under whichever root reaches it first.
+An account with no root config at all means all of My Drive. Duplicate root
+ids are ignored (first entry wins). If one tracked root lies inside another,
+the overlapping subtree is indexed once — under whichever root reaches it
+first.
 
 ## What gets indexed
 

@@ -92,8 +92,7 @@ export interface DriveWorld {
   exportsPlain?: Record<string, string | HostResponse>;
   /** fileId → alt=media result. */
   media?: Record<string, Uint8Array | HostResponse>;
-  /** fileId → metadata GET result (?fields=… — shallow / shortcut target /
-   *  connect folder validation). */
+  /** fileId → metadata GET result (?fields=… — shallow / shortcut target). */
   gets?: Record<string, DriveFile | HostResponse>;
   about?: { emailAddress?: string; displayName?: string };
   /** Checked first; return undefined to fall through to the world tables.
@@ -277,7 +276,6 @@ export function makeSession(
 export function makeAuth(
   opts: {
     creds?: Credentials;
-    answers?: Record<string, unknown>;
     /** pickFolders resolves this selection (default: My Drive) — or, when a
      *  function, drives the spec itself (e.g. to reject as a user cancel). */
     picked?: FolderNode[] | ((spec: FolderPickerSpec) => Promise<FolderNode[]>);
@@ -286,20 +284,14 @@ export function makeAuth(
   auth: AuthChannel;
   statuses: string[];
   getScopes: () => string[] | undefined;
-  getSchema: () => unknown;
   getPickerSpec: () => FolderPickerSpec | undefined;
 } {
   let scopes: string[] | undefined;
-  let schema: unknown;
   let pickerSpec: FolderPickerSpec | undefined;
   const auth = fakeAuthChannel({
     oauth: async (s) => {
       scopes = s;
       return opts.creds ?? { accessToken: 'ya29.test-deadbeef' };
-    },
-    prompt: async (s) => {
-      schema = s;
-      return opts.answers ?? {};
     },
     pickFolders: async (spec) => {
       pickerSpec = spec;
@@ -311,7 +303,6 @@ export function makeAuth(
     auth,
     statuses: auth.statuses,
     getScopes: () => scopes,
-    getSchema: () => schema,
     getPickerSpec: () => pickerSpec,
   };
 }

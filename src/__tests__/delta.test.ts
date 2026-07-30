@@ -369,7 +369,7 @@ describe('delta', () => {
       query,
     );
     const { session } = makeSession({
-      config: { rootFolderId: 'FOLD1', rootName: 'Projects' },
+      config: { roots: [{ rootFolderId: 'FOLD1', rootName: 'Projects' }] },
     });
 
     const batches = (await collect(source.pull(session, LIVE))) as B[];

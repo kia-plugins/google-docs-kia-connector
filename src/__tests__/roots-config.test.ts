@@ -1,7 +1,6 @@
 /**
- * rootsConfig normalization: the v2.1.0 multi-root shape, the legacy v2.0.0
- * single-root fields, the My Drive default, per-entry name fallbacks, and
- * dedupe by rootFolderId.
+ * rootsConfig normalization: the multi-root shape, the My Drive default,
+ * per-entry name fallbacks, and dedupe by rootFolderId.
  */
 import { rootsConfig } from '../source';
 import { makeSession } from '../testing/harness';
@@ -41,24 +40,9 @@ describe('rootsConfig', () => {
     ).toEqual([{ rootFolderId: 'FA', rootName: 'Alpha' }]);
   });
 
-  it('an empty or all-invalid roots array falls through to the legacy/default path', () => {
+  it('an empty or all-invalid roots array falls through to the My Drive default', () => {
     expect(roots({ roots: [] })).toEqual([{ rootFolderId: 'root', rootName: 'My Drive' }]);
-    expect(roots({ roots: [{ rootFolderId: 7 }], rootFolderId: 'FOLD1', rootName: 'P' })).toEqual([
-      { rootFolderId: 'FOLD1', rootName: 'P' },
-    ]);
-  });
-
-  it('normalizes the legacy v2.0.0 single-root config', () => {
-    expect(roots({ rootFolderId: 'FOLD1', rootName: 'Projects' })).toEqual([
-      { rootFolderId: 'FOLD1', rootName: 'Projects' },
-    ]);
-  });
-
-  it('legacy config without rootName falls back to the id (or My Drive for root)', () => {
-    expect(roots({ rootFolderId: 'FOLD1' })).toEqual([
-      { rootFolderId: 'FOLD1', rootName: 'FOLD1' },
-    ]);
-    expect(roots({ rootFolderId: 'root' })).toEqual([
+    expect(roots({ roots: [{ rootFolderId: 7 }] })).toEqual([
       { rootFolderId: 'root', rootName: 'My Drive' },
     ]);
   });
