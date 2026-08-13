@@ -7,6 +7,8 @@
 import { createGoogleDocsSource, DRIVE_SCOPES } from '../source';
 import {
   driveFetch,
+  fakeAccount,
+  fakeQuery,
   folder,
   instantClock,
   makeAuth,
@@ -121,5 +123,87 @@ describe('connect', () => {
     const { auth } = makeAuth({ creds: { refreshToken: '1//fake-refresh-test' } });
     await expect(source.connect(auth)).rejects.toThrow(/no access token/);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('reconnect after auth failure keeps the stored selection', () => {
+  const about = { emailAddress: 'ed@example.com', displayName: 'Ed' };
+
+  it('skips the picker and returns the prior config verbatim', async () => {
+    const { fetchFn, calls } = driveFetch({ about });
+    const prior = fakeAccount({
+      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, statuses, getPickerSpec } = makeAuth();
+
+    const res = await source.connect(auth);
+
+    expect(res).toEqual({ identifier: 'ed@example.com', config: prior.config });
+    expect(getPickerSpec()).toBeUndefined();
+    expect(statuses).toEqual([
+      'Waiting for Google sign-in…',
+      'Fetching Drive profile…',
+      'Restoring previous folder selection…',
+    ]);
+    // Only the about call — no folder lookups on the restore path.
+    expect(calls).toHaveLength(1);
+  });
+
+  it('restores a legacy config with no explicit roots (all of My Drive) verbatim', async () => {
+    const { fetchFn } = driveFetch({ about });
+    const prior = fakeAccount({ config: {} });
+    const source = createGoogleDocsSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth();
+
+    const res = await source.connect(auth);
+
+    expect(res).toEqual({ identifier: 'ed@example.com', config: {} });
+    expect(getPickerSpec()).toBeUndefined();
+  });
+
+  it('a healthy account with the same identifier still runs the picker', async () => {
+    const { fetchFn } = driveFetch({ about });
+    const prior = fakeAccount({
+      status: 'live',
+      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth({
+      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
+    });
+
+    const res = await source.connect(auth);
+
+    expect(getPickerSpec()).toBeDefined();
+    expect(res.config).toEqual({ roots: [{ rootFolderId: 'NEW1', rootName: 'New' }] });
+  });
+
+  it('a needsReauth account under a different identity does not hijack the flow', async () => {
+    const { fetchFn } = driveFetch({ about });
+    const prior = fakeAccount({ identifier: 'other@example.com' });
+    const source = createGoogleDocsSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth({
+      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
+    });
+
+    const res = await source.connect(auth);
+
+    expect(getPickerSpec()).toBeDefined();
+    expect(res.identifier).toBe('ed@example.com');
+    expect(res.config).toEqual({ roots: [{ rootFolderId: 'NEW1', rootName: 'New' }] });
+  });
+
+  it("another source's needsReauth account with the same identifier is ignored", async () => {
+    const { fetchFn } = driveFetch({ about });
+    const prior = fakeAccount({ source: 'gmail' });
+    const source = createGoogleDocsSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth({
+      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
+    });
+
+    await source.connect(auth);
+
+    expect(getPickerSpec()).toBeDefined();
   });
 });

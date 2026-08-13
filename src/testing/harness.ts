@@ -13,6 +13,7 @@
  * as a suite. Never bundled: build.mjs only follows imports from index.ts.
  */
 import type {
+  Account,
   AuthChannel,
   Credentials,
   Document,
@@ -202,7 +203,7 @@ export function driveFetch(world: DriveWorld = {}): {
   return { fetchFn, calls };
 }
 
-export function fakeQuery(docs: Document[] = []): Query & {
+export function fakeQuery(docs: Document[] = [], accounts: Account[] = []): Query & {
   byExternalIdCalls: Array<{ account: string; externalId: string; type: string }>;
 } {
   const byExternalIdCalls: Array<{ account: string; externalId: string; type: string }> = [];
@@ -223,7 +224,22 @@ export function fakeQuery(docs: Document[] = []): Query & {
     children: unused,
     search: unused,
     count: unused,
-    accounts: unused,
+    accounts: async () => accounts,
+  };
+}
+
+/** A stored account as `host.query.accounts()` reports it — defaults to this
+ *  connector's identity in the state the reconnect flow gates on. */
+export function fakeAccount(over: Partial<Account> = {}): Account {
+  return {
+    id: 'acc-prior' as Account['id'],
+    source: 'google-docs',
+    identifier: 'ed@example.com',
+    config: {},
+    status: 'needsReauth',
+    cursor: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    ...over,
   };
 }
 

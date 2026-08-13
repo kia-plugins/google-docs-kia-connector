@@ -764,6 +764,23 @@ export function createGoogleDocsSource(
       if (!about.user?.emailAddress) {
         throw new Error('google-docs: Drive about response missing user.emailAddress');
       }
+      const email = about.user.emailAddress;
+
+      // Reconnect after an auth failure restores the stored selection: the
+      // picker opens BLANK (no preselection), so re-asking here invites a
+      // careless confirm that silently shrinks the corpus. The config rides
+      // back VERBATIM — legacy shapes (no explicit roots = all of My Drive)
+      // included. A healthy re-connect still runs the picker: it is the only
+      // way to change the selection; the engine upserts on
+      // (source, identifier) either way, so documents and cursor survive.
+      const prior = (await host.query.accounts()).find(
+        (a) =>
+          a.source === 'google-docs' && a.identifier === email && a.status === 'needsReauth',
+      );
+      if (prior) {
+        auth.status('Restoring previous folder selection…');
+        return { identifier: email, config: prior.config };
+      }
 
       // The platform's shared folder-picker: lazy tree over the connect-time
       // client, multi-select with covering roots. A user cancel rejects —
