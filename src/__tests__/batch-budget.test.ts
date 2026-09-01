@@ -102,6 +102,32 @@ describe('batch byte budget', () => {
     expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
   });
 
+  it('delta: markdown is budgeted in UTF-8 bytes, not UTF-16 code units', async () => {
+    // 'ää' = 2 code units but 4 UTF-8 bytes: two docs cross a 5-byte budget
+    // only when bytes are counted.
+    const { source } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'd1', file: gdoc('d1', 'One') },
+              { fileId: 'd2', file: gdoc('d2', 'Two') },
+              { fileId: 'd3', file: gdoc('d3', 'Three') },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        exportsMd: { d1: 'ää', d2: 'ää', d3: 'ää' },
+      },
+      { batchByteBudget: 5 },
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches.map(ids)).toEqual([['d1', 'd2'], ['d3']]);
+  });
+
   it('delta: a budget hit on the last item still advances the token via a trailing empty chunk', async () => {
     const { source } = makeSource(
       {

@@ -70,10 +70,11 @@ export const MAX_BINARY_BYTES = 25 * 1024 * 1024;
  * same page replays on every retry — a deterministic crash loop that
  * surfaces as "extension process exited". So a page is flushed to the engine
  * in sub-page chunks once accumulated payload or entry count cross these
- * budgets — see `ChunkAccumulator`.
+ * budgets — see `ChunkAccumulator`. Both are soft ceilings checked AFTER an
+ * entry is added, so a chunk can overshoot by one file (≤ MAX_BINARY_BYTES).
  */
 export const BATCH_BYTE_BUDGET = 32 * 1024 * 1024;
-export const BATCH_ITEM_LIMIT = 100;
+export const BATCH_ITEM_LIMIT = 250;
 
 export interface BatchBudget {
   bytes: number;
@@ -354,7 +355,9 @@ class ChunkAccumulator {
 
   add(item: DriveItem): void {
     this.items.push(item);
-    this.size += item.bytes?.byteLength ?? item.markdown?.length ?? 0;
+    // Markdown is UTF-16 in memory and UTF-8 on the wire — measure bytes,
+    // not code units, or non-ASCII documents undercount 2–3×.
+    this.size += item.bytes?.byteLength ?? (item.markdown ? Buffer.byteLength(item.markdown, 'utf8') : 0);
   }
 
   addDeletions(refs: ExternalRef[]): void {
