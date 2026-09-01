@@ -731,45 +731,41 @@ async function* delta(
     // mid-page replays the page rather than skipping its remainder.
     const pageCursor: DriveCursor = { page_token: pageToken, backfill_done: true };
     const acc = new ChunkAccumulator(budget);
+    const ingest = async (c: { fileId: string; removed?: boolean; file?: DriveFile }): Promise<void> => {
+      if (c.removed || c.file?.trashed) {
+        acc.addDeletions(await existingRefs(query, session, c.fileId));
+        index.delete(c.fileId);
+        return;
+      }
+      if (!c.file) return;
+      if (c.file.mimeType === GOOGLE_FOLDER_MIME) {
+        // Track the move/rename for later ancestor walks. Descendants'
+        // display_path is NOT re-rendered (v1 parity — see README).
+        index.set(c.file.id, { name: c.file.name, parents: c.file.parents ?? [] });
+        return;
+      }
+      const scope = await resolveScope(c.file, rootIds, index, client);
+      if (!scope.inScope) {
+        // Moved out of every indexed subtree: archive whatever exists locally.
+        acc.addDeletions(await existingRefs(query, session, c.fileId));
+        return;
+      }
+      const item = await buildItem(c.file, scope.segments, byRootId.get(scope.rootId!)!, deps);
+      if (item) acc.add(item);
+    };
     for (const c of byId.values()) {
       if (session.signal.aborted) return;
       try {
-        if (c.removed || c.file?.trashed) {
-          acc.addDeletions(await existingRefs(query, session, c.fileId));
-          index.delete(c.fileId);
-          continue;
-        }
-        if (!c.file) continue;
-        if (c.file.mimeType === GOOGLE_FOLDER_MIME) {
-          // Track the move/rename for later ancestor walks. Descendants'
-          // display_path is NOT re-rendered (v1 parity — see README).
-          index.set(c.file.id, { name: c.file.name, parents: c.file.parents ?? [] });
-          continue;
-        }
-        const scope = await resolveScope(c.file, rootIds, index, client);
-        if (!scope.inScope) {
-          // Moved out of every indexed subtree: archive whatever exists locally.
-          acc.addDeletions(await existingRefs(query, session, c.fileId));
-          continue;
-        }
-        const item = await buildItem(
-          c.file,
-          scope.segments,
-          byRootId.get(scope.rootId!)!,
-          deps,
-        );
-        if (item) acc.add(item);
+        await ingest(c);
       } catch (e) {
         // Per-file guard — the v1-bug-3 fix: one bad file never aborts the
         // tick. Auth errors propagate.
         if (isAuthError(e)) throw e;
         session.log('warn', `google-docs delta: file ${c.fileId} skipped: ${errText(e)}`);
-      } finally {
-        // `continue` above must still flush — hence finally.
-        if (acc.full()) {
-          const chunk = acc.take();
-          yield { phase: 'live', items: chunk.items, deletions: chunk.deletions, cursor: pageCursor };
-        }
+      }
+      if (acc.full()) {
+        const chunk = acc.take();
+        yield { phase: 'live', items: chunk.items, deletions: chunk.deletions, cursor: pageCursor };
       }
     }
 
