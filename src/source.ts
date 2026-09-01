@@ -59,6 +59,26 @@ export const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 export const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
 /** v1 had NO cap (whole file into a Buffer — v1 gap #6); v2 binds one. */
 export const MAX_BINARY_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Per-batch flush budget. Listing / changes pages are requested at pageSize
+ * 1000 and every convertible file in one carries either up to
+ * MAX_BINARY_BYTES of downloaded bytes or a native-export markdown string.
+ * Holding a whole page's payload at once (then structured-cloning it over
+ * IPC in ONE message) can exceed the extension process heap; and because the
+ * cursor only advances per page (backfill: never, until the live flip) the
+ * same page replays on every retry — a deterministic crash loop that
+ * surfaces as "extension process exited". So a page is flushed to the engine
+ * in sub-page chunks once accumulated payload or entry count cross these
+ * budgets — see `ChunkAccumulator`.
+ */
+export const BATCH_BYTE_BUDGET = 32 * 1024 * 1024;
+export const BATCH_ITEM_LIMIT = 100;
+
+export interface BatchBudget {
+  bytes: number;
+  items: number;
+}
 /** v1 path-resolver's ancestor-walk bound, cycle-safe. */
 const MAX_ANCESTOR_HOPS = 64;
 
@@ -322,6 +342,41 @@ interface ItemDeps {
   query: Query;
 }
 
+/** Accumulates one page's items/deletions and says when a chunk is due
+ *  (see BATCH_BYTE_BUDGET). Deletions are cheap but count against the entry
+ *  limit so a mass-delete page is still bounded. */
+class ChunkAccumulator {
+  items: DriveItem[] = [];
+  deletions: ExternalRef[] = [];
+  private size = 0;
+
+  constructor(private readonly budget: BatchBudget) {}
+
+  add(item: DriveItem): void {
+    this.items.push(item);
+    this.size += item.bytes?.byteLength ?? item.markdown?.length ?? 0;
+  }
+
+  addDeletions(refs: ExternalRef[]): void {
+    this.deletions.push(...refs);
+  }
+
+  full(): boolean {
+    return (
+      this.size >= this.budget.bytes || this.items.length + this.deletions.length >= this.budget.items
+    );
+  }
+
+  /** Hands out the pending chunk and resets. */
+  take(): { items: DriveItem[]; deletions: ExternalRef[] } {
+    const chunk = { items: this.items, deletions: this.deletions };
+    this.items = [];
+    this.deletions = [];
+    this.size = 0;
+    return chunk;
+  }
+}
+
 /** Query-first content-hash skip: an unchanged, still-live document is never
  *  re-exported / re-downloaded (v1 ingest.ts's metadata-only refresh, minus
  *  the metadata refresh — the v2 engine owns row freshness). An ARCHIVED
@@ -463,10 +518,11 @@ async function buildItem(
 
 /**
  * BFS backfill across ALL configured roots (v1 backfill.ts walkFolder). One
- * batch per files.list page; the cursor stays `{ page_token, backfill_done:
- * false }` the whole walk — a crash at any boundary redoes the walk, which
- * is SAFE (idempotent upserts) and cheap (hash-skip). Ends with a final
- * `live` flip batch.
+ * batch per files.list page — or several, when a page's payload crosses the
+ * batch budget; the cursor stays `{ page_token, backfill_done: false }` the
+ * whole walk — a crash at any boundary redoes the walk, which is SAFE
+ * (idempotent upserts) and cheap (hash-skip). Ends with a final `live` flip
+ * batch.
  */
 async function* backfill(
   client: DriveClient,
@@ -474,6 +530,7 @@ async function* backfill(
   query: Query,
   cursor: DriveCursor | null,
   roots: RootConfig[],
+  budget: BatchBudget,
 ): AsyncGenerator<Batch<DriveCursor, DriveItem>> {
   // A non-empty saved page_token predates the interrupted walk — a superset
   // of the changes we might miss — so KEEP it; never recapture mid-backfill.
@@ -506,7 +563,8 @@ async function* backfill(
       listUrl(head.folderId, head.pageToken),
     );
 
-    const items: DriveItem[] = [];
+    const walkCursor: DriveCursor = { page_token: pageToken, backfill_done: false };
+    const acc = new ChunkAccumulator(budget);
     for (const f of page.files ?? []) {
       if (session.signal.aborted) return;
       if (f.mimeType === GOOGLE_FOLDER_MIME) {
@@ -523,19 +581,16 @@ async function* backfill(
       }
       try {
         const item = await buildItem(f, head.segments, head.root, deps);
-        if (item) items.push(item);
+        if (item) acc.add(item);
       } catch (e) {
         // One unreadable file must not abort the walk (v1 backfill parity).
         if (isAuthError(e)) throw e;
         session.log('warn', `google-docs backfill: file ${f.id} skipped: ${errText(e)}`);
       }
+      if (acc.full()) yield { phase: 'backfill', items: acc.take().items, cursor: walkCursor };
     }
 
-    yield {
-      phase: 'backfill',
-      items,
-      cursor: { page_token: pageToken, backfill_done: false },
-    };
+    yield { phase: 'backfill', items: acc.take().items, cursor: walkCursor };
 
     if (page.nextPageToken) {
       queue.unshift({ ...head, pageToken: page.nextPageToken });
@@ -617,6 +672,7 @@ async function* delta(
   query: Query,
   cursor: DriveCursor,
   roots: RootConfig[],
+  budget: BatchBudget,
 ): AsyncGenerator<Batch<DriveCursor, DriveItem>> {
   const deps: ItemDeps = { client, session, query };
   const index: FolderIndex = new Map();
@@ -670,13 +726,16 @@ async function* delta(
     const byId = new Map<string, { fileId: string; removed?: boolean; file?: DriveFile }>();
     for (const c of page.changes ?? []) byId.set(c.fileId, c);
 
-    const items: DriveItem[] = [];
-    const deletions: ExternalRef[] = [];
+    // Intermediate (budget-flushed) chunks commit under the token that
+    // fetched THIS page; only the page's final chunk advances it, so a crash
+    // mid-page replays the page rather than skipping its remainder.
+    const pageCursor: DriveCursor = { page_token: pageToken, backfill_done: true };
+    const acc = new ChunkAccumulator(budget);
     for (const c of byId.values()) {
       if (session.signal.aborted) return;
       try {
         if (c.removed || c.file?.trashed) {
-          deletions.push(...(await existingRefs(query, session, c.fileId)));
+          acc.addDeletions(await existingRefs(query, session, c.fileId));
           index.delete(c.fileId);
           continue;
         }
@@ -690,7 +749,7 @@ async function* delta(
         const scope = await resolveScope(c.file, rootIds, index, client);
         if (!scope.inScope) {
           // Moved out of every indexed subtree: archive whatever exists locally.
-          deletions.push(...(await existingRefs(query, session, c.fileId)));
+          acc.addDeletions(await existingRefs(query, session, c.fileId));
           continue;
         }
         const item = await buildItem(
@@ -699,20 +758,27 @@ async function* delta(
           byRootId.get(scope.rootId!)!,
           deps,
         );
-        if (item) items.push(item);
+        if (item) acc.add(item);
       } catch (e) {
         // Per-file guard — the v1-bug-3 fix: one bad file never aborts the
         // tick. Auth errors propagate.
         if (isAuthError(e)) throw e;
         session.log('warn', `google-docs delta: file ${c.fileId} skipped: ${errText(e)}`);
+      } finally {
+        // `continue` above must still flush — hence finally.
+        if (acc.full()) {
+          const chunk = acc.take();
+          yield { phase: 'live', items: chunk.items, deletions: chunk.deletions, cursor: pageCursor };
+        }
       }
     }
 
     const next = page.nextPageToken ?? page.newStartPageToken ?? pageToken;
+    const last = acc.take();
     yield {
       phase: 'live',
-      items,
-      deletions,
+      items: last.items,
+      deletions: last.deletions,
       cursor: { page_token: next, backfill_done: true },
     };
 
@@ -721,12 +787,23 @@ async function* delta(
   }
 }
 
+export interface GoogleDocsTestSeams extends Partial<Pick<DriveClientDeps, 'sleep' | 'random'>> {
+  batchByteBudget?: number;
+  batchItemLimit?: number;
+}
+
 export function createGoogleDocsSource(
   host: HostFor<'net' | 'query'>,
   // Test seam only: DriveClient's sleep/random are injectable so retry tests
-  // never actually wait; production callers omit this.
-  clock?: Pick<DriveClientDeps, 'sleep' | 'random'>,
+  // never actually wait, and the batch budgets shrink so chunking is
+  // testable with tiny fixtures; production callers omit this.
+  seams?: GoogleDocsTestSeams,
 ): Source<DriveCursor, DriveItem> {
+  const { batchByteBudget, batchItemLimit, ...clock } = seams ?? {};
+  const budget: BatchBudget = {
+    bytes: batchByteBudget ?? BATCH_BYTE_BUDGET,
+    items: batchItemLimit ?? BATCH_ITEM_LIMIT,
+  };
   const clientFor = (session: Session): DriveClient =>
     new DriveClient({
       fetch: host.net.fetch,
@@ -809,9 +886,9 @@ export function createGoogleDocsSource(
       const client = clientFor(session);
       const roots = rootsConfig(session);
       if (!cursor || !cursor.backfill_done) {
-        yield* backfill(client, session, host.query, cursor, roots);
+        yield* backfill(client, session, host.query, cursor, roots, budget);
       } else {
-        yield* delta(client, session, host.query, cursor, roots);
+        yield* delta(client, session, host.query, cursor, roots, budget);
       }
     },
 
