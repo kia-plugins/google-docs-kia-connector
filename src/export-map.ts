@@ -2,32 +2,31 @@
  * v2 port of v1 export-map.ts (v1 repo `git show
  * main:src/main/connectors/google-docs/export-map.ts`).
  *
- * Route shape is v1's; two v2 deltas:
+ * Route shape is v1's; three v2 deltas:
  *
  *  1. Native Google Docs export as `text/markdown` (Drive exports Docs to
  *     Markdown natively) instead of v1's `text/html` + converter pipeline —
  *     the exported text IS the document markdown. `text/plain` is the
  *     fallback when the markdown export fails non-retryably.
  *
- *  2. The convertible set is bound to what the v2 ENGINE actually extracts
- *     from binary documents emitted with `markdown: null` (verified in
- *     kiagent-core, branch greenfield):
- *      - deterministic converters — kiagent-core
- *        src/main/core/engine/convert.ts:43-84: application/pdf, docx
- *        (…wordprocessingml.document), xlsx (…spreadsheetml.sheet), and any
- *        `text/*` (which subsumes v1's text/plain, text/markdown, text/html,
- *        text/csv);
- *      - the two-pass vision pipeline — kiagent-core
- *        src/main/workers/vision/classify.ts:48-63 marks `type: 'file'` docs
- *        with pdf/image content as OCR/VLM candidates and the vision worker
- *        pulls bytes back through this source's `fetchBytes`
- *        (src/main/workers/vision/vision-worker.ts:44) — so `image/*` is
- *        convertible here too (v1 routed images unsupported).
+ *  2. Binary routing is delegated to the connector SDK's canonical
+ *     `decideFileIndexing` policy (profile `'cloud-drive'`) instead of a
+ *     connector-local `isConvertibleMime` allowlist. That policy is the
+ *     single source of truth shared with every other cloud/local source in
+ *     kiagent-core — see `@kiagent/connector-sdk`'s `file-indexability`
+ *     module doc for the full branch-by-branch rationale. Under
+ *     `'cloud-drive'` it ignores archives (any size), all audio/video
+ *     (`reason: 'cloud-media'`, regardless of size), and anything outside
+ *     the PDF/Office/text/image allowlist, and caps converter/PDF binaries
+ *     at `MAX_CLOUD_BINARY_BYTES` (25 MiB) and images at
+ *     `MAX_CLOUD_IMAGE_BYTES` (20 MiB) — both inclusive at the boundary.
+ *     NEVER download bytes for a route whose `kind` is `'ignore'`.
  *
- * v1's exact-match set (text/plain, text/markdown, text/html, application/pdf,
- * docx, xlsx, text/csv) is a strict subset of this one, so nothing v1 indexed
- * is dropped. NEVER download bytes for a non-convertible mime.
+ *  3. Google-native precedence stays first and outside the SDK policy: the
+ *     policy only ever sees binary `file` mime types, never
+ *     `application/vnd.google-apps.*` — those routes are decided here.
  */
+import { decideFileIndexing, type FileIgnoreReason } from '@kiagent/connector-sdk';
 
 export const GOOGLE_DOC_MIME = 'application/vnd.google-apps.document';
 export const GOOGLE_FOLDER_MIME = 'application/vnd.google-apps.folder';
@@ -36,35 +35,34 @@ export const GOOGLE_SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
 export const EXPORT_MIME = 'text/markdown';
 export const EXPORT_FALLBACK_MIME = 'text/plain';
 
-const DOCX_MIME =
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-const XLSX_MIME =
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-
-/** Binary mimes the v2 engine can turn into text — see module doc for the
- *  file:line evidence behind each entry. */
-export function isConvertibleMime(mimeType: string): boolean {
-  return (
-    mimeType.startsWith('text/') ||
-    mimeType.startsWith('image/') ||
-    mimeType === 'application/pdf' ||
-    mimeType === DOCX_MIME ||
-    mimeType === XLSX_MIME
-  );
-}
-
-export type Route =
+export type DriveRoute =
   | { kind: 'native' }
-  | { kind: 'binary' }
-  | { kind: 'unsupported' };
+  | { kind: 'binary'; pipeline: 'converter' | 'vision' }
+  | { kind: 'ignore'; reason: FileIgnoreReason };
 
-export function chooseRoute(mimeType: string): Route {
+/**
+ * Routes one Drive file (already shortcut-resolved) by mime/filename/size.
+ * Google-native precedence stays first and outside the SDK policy — Docs
+ * export as markdown, every other `application/vnd.google-apps.*` type
+ * (Sheets, Slides, Forms, …) has no bytes to download and is ignored as
+ * `'unsupported'`. Everything else is a binary `file` row, decided by the
+ * SDK's canonical `decideFileIndexing` under the `'cloud-drive'` profile.
+ */
+export function chooseRoute(
+  mimeType: string,
+  filename: string,
+  sizeBytes?: number,
+): DriveRoute {
   if (mimeType === GOOGLE_DOC_MIME) return { kind: 'native' };
-  // Other Google-native types (spreadsheet, presentation, form, …) have no
-  // bytes to download — metadata-only rows. Sheets/Slides export stays
-  // deferred (v1 parity).
   if (mimeType.startsWith('application/vnd.google-apps.'))
-    return { kind: 'unsupported' };
-  if (isConvertibleMime(mimeType)) return { kind: 'binary' };
-  return { kind: 'unsupported' };
+    return { kind: 'ignore', reason: 'unsupported' };
+  const d = decideFileIndexing({
+    profile: 'cloud-drive',
+    filename,
+    mime: mimeType,
+    sizeBytes,
+  });
+  return d.kind === 'ignore'
+    ? d
+    : { kind: 'binary', pipeline: d.pipeline === 'vision' ? 'vision' : 'converter' };
 }

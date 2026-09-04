@@ -10,11 +10,13 @@ import {
 import { DriveApiError } from '../client';
 import type { DocumentInput } from '@kiagent/connector-sdk';
 import {
+  binaryFile,
   collect,
   driveFetch,
   fakeDoc,
   folder,
   gdoc,
+  googleNative,
   instantClock,
   jsonRes,
   makeHost,
@@ -30,13 +32,8 @@ function makeSource(world: Parameters<typeof driveFetch>[0]) {
 }
 
 describe('reconcile', () => {
-  it('lists the full tree, refs typed as routing would emit, shortcuts ref the TARGET id', async () => {
-    const sheet = {
-      id: 'sheet1',
-      name: 'Budget',
-      mimeType: 'application/vnd.google-apps.spreadsheet',
-      parents: ['MYDRIVE'],
-    };
+  it('lists the full tree, refs typed as routing would emit, shortcuts ref the TARGET id; ignored files/shortcut targets are omitted', async () => {
+    const sheet = googleNative('sheet1', 'Budget', 'application/vnd.google-apps.spreadsheet');
     const { source, calls } = makeSource({
       lists: {
         root: [
@@ -44,8 +41,13 @@ describe('reconcile', () => {
           folder('S', 'Sub'),
           pdf('pdfB', 'b.pdf'),
           sheet,
+          binaryFile('mp3-1', 'song.mp3', 'audio/mpeg'),
+          binaryFile('zip-1', 'archive.zip', 'application/zip'),
           shortcut('sc1', 'Link', 'TD1', 'application/vnd.google-apps.document'),
           shortcut('sc2', 'Chain', 'TD2', 'application/vnd.google-apps.shortcut'),
+          // A shortcut whose target is itself ignored (cloud-media) — the
+          // target mime alone decides, no target fetch needed.
+          shortcut('sc3', 'Song link', 'TD3', 'audio/mpeg'),
         ],
         S: [gdoc('docC', 'Doc C', { parents: ['S'] })],
       },
@@ -58,13 +60,13 @@ describe('reconcile', () => {
       [
         { externalId: 'docA', type: 'gdocs.doc' },
         { externalId: 'pdfB', type: 'file' },
-        { externalId: 'sheet1', type: 'file' },
         { externalId: 'TD1', type: 'gdocs.doc' },
       ],
       [{ externalId: 'docC', type: 'gdocs.doc' }],
     ]);
     // Ref typing comes from shortcutDetails.targetMimeType — no target fetch.
     expect(calls.some((u) => u.includes('/files/TD1'))).toBe(false);
+    expect(calls.some((u) => u.includes('/files/TD3'))).toBe(false);
   });
 
   it('multi-root: lists every root; an overlapping subtree (root inside root) is listed once', async () => {

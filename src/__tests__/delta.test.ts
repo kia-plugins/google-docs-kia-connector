@@ -8,6 +8,7 @@ import { createGoogleDocsSource, type DriveCursor, type DriveItem } from '../sou
 import { GoogleDocsAuthError } from '../client';
 import type { Batch } from '@kiagent/connector-sdk';
 import {
+  binaryFile,
   collect,
   driveFetch,
   fakeDoc,
@@ -19,6 +20,7 @@ import {
   makeHost,
   makeSession,
   pdf,
+  shortcut,
 } from '../testing/harness';
 
 type B = Batch<DriveCursor, DriveItem>;
@@ -96,6 +98,80 @@ describe('delta', () => {
 
     const batches = (await collect(source.pull(session, LIVE))) as B[];
     expect(batches[0].deletions).toEqual([{ externalId: 'tr1', type: 'file' }]);
+  });
+
+  it('a policy-ignored change (MP3) to a pre-existing live file doc: exactly one deletion ref, no item, no download', async () => {
+    const query = fakeQuery([fakeDoc('mp3-1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [{ fileId: 'mp3-1', file: binaryFile('mp3-1', 'song.mp3', 'audio/mpeg') }],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'mp3-1', type: 'file' }]);
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+  });
+
+  it('a policy-ignored change (ZIP) to a pre-existing live file doc: exactly one deletion ref, no item, no download', async () => {
+    const query = fakeQuery([fakeDoc('zip-1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'zip-1', file: binaryFile('zip-1', 'archive.zip', 'application/zip') },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'zip-1', type: 'file' }]);
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+  });
+
+  it('a shortcut whose target mime is audio/mpeg is ignored after target resolution: deletion when a local row exists, no download', async () => {
+    const query = fakeQuery([fakeDoc('song-target', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'sc1', file: shortcut('sc1', 'Song link', 'song-target', 'audio/mpeg') },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        gets: { 'song-target': binaryFile('song-target', 'song.mp3', 'audio/mpeg') },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'song-target', type: 'file' }]);
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+    // Target resolution DID happen (needed to learn the real mime) — the
+    // download that follows a positive route did not.
+    expect(calls.some((u) => u.includes('song-target'))).toBe(true);
   });
 
   it('out-of-scope move → deletion ref for the locally existing doc, nothing downloaded', async () => {

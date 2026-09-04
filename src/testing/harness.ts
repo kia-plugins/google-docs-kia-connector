@@ -224,6 +224,7 @@ export function fakeQuery(docs: Document[] = [], accounts: Account[] = []): Quer
     children: unused,
     search: unused,
     count: unused,
+    countBy: unused,
     accounts: async () => accounts,
   };
 }
@@ -375,16 +376,45 @@ export function folder(id: string, name: string, over: Partial<DriveFile> = {}):
   };
 }
 
-export function pdf(id: string, name: string, over: Partial<DriveFile> = {}): DriveFile {
+/** Generic binary `file` row — any mime, so tests can build media/archive/
+ *  unsupported fixtures without hand-rolling the whole DriveFile shape. */
+export function binaryFile(
+  id: string,
+  name: string,
+  mimeType: string,
+  over: Partial<DriveFile> = {},
+): DriveFile {
   return {
     id,
     name,
-    mimeType: 'application/pdf',
+    mimeType,
     parents: ['MYDRIVE'],
     md5Checksum: `md5-${id}-1`,
     size: '2048',
     modifiedTime: '2026-05-02T10:00:00Z',
     createdTime: '2026-04-02T10:00:00Z',
+    ...over,
+  };
+}
+
+export function pdf(id: string, name: string, over: Partial<DriveFile> = {}): DriveFile {
+  return binaryFile(id, name, 'application/pdf', over);
+}
+
+/** A non-Doc Google-native type (Sheets/Slides/Forms/…) — no bytes to
+ *  download, policy-ignored as `'unsupported'`. */
+export function googleNative(
+  id: string,
+  name: string,
+  mimeType: string,
+  over: Partial<DriveFile> = {},
+): DriveFile {
+  return {
+    id,
+    name,
+    mimeType,
+    parents: ['MYDRIVE'],
+    modifiedTime: '2026-05-01T00:00:00Z',
     ...over,
   };
 }
