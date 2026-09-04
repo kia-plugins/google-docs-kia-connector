@@ -164,6 +164,22 @@ describe('countFilesUnder', () => {
     expect(calls.some((u) => u.includes('TD1'))).toBe(false);
   });
 
+  it('counts (over-admits) a shortcut whose target mime is generic/ambiguous rather than undercounting — the real name/extension is unknown from a listing, so a rescue that ingest would apply cannot be ruled out', async () => {
+    const { fetchFn, calls } = driveFetch({
+      lists: {
+        F1: [
+          shortcut('sc1', 'Ambiguous link', 'TD1', 'application/octet-stream'),
+          gdoc('d1', 'Doc'),
+        ],
+      },
+    });
+
+    const res = await countFilesUnder(makeClient(fetchFn), 'F1');
+
+    expect(res).toEqual({ count: 2, capped: false });
+    expect(calls.some((u) => u.includes('TD1'))).toBe(false);
+  });
+
   it('stops when the 20-page request budget runs out mid-walk → capped, lower bound', async () => {
     // 21 pages of one file each: the 21st page would exceed the budget.
     const pages = Array.from({ length: 21 }, (_, i) => [pdf(`p${i}`, `f${i}.pdf`)]);

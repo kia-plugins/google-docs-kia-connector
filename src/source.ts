@@ -54,6 +54,7 @@ import {
   GOOGLE_DOC_MIME,
   GOOGLE_FOLDER_MIME,
   GOOGLE_SHORTCUT_MIME,
+  type DriveRoute,
 } from './export-map';
 
 export const DRIVE_API = 'https://www.googleapis.com/drive/v3';
@@ -240,6 +241,38 @@ function countListUrl(folderId: string, pageToken?: string): string {
 }
 
 /**
+ * Whether an 'ignore' route computed for a SHORTCUT target (filename always
+ * `''`, since a listing never returns the target's real name — see
+ * `chooseRoute` call sites below) can be trusted as a genuine ignore.
+ *
+ * Two reasons are mime-final and always trustworthy regardless of the
+ * (unknown) real filename: 'archive' and 'cloud-media' are decided purely
+ * from `mime`/mime-prefix, never from an extension, when the filename is
+ * `''`. So is ANY ignore verdict for a Google-native target mime
+ * (`application/vnd.google-apps.*`) — `chooseRoute` decides those before
+ * ever consulting the SDK's extension-aware branches, and no extension
+ * could rescue a native format anyway.
+ *
+ * A plain 'unsupported' verdict for a non-Google-native mime is NOT
+ * trustworthy here: the SDK's extension-rescue branches (e.g. a generic
+ * `application/octet-stream` mime paired with a `.pdf` name) could still
+ * admit the file once its real name is known — which is exactly what
+ * `buildItem`'s shortcut-resolution branch sees, since it fetches the
+ * target's full metadata (real name included) before routing. Reconcile
+ * and countFilesUnder never see that name, so they must NOT omit/undercount
+ * on this ambiguous case: over-admitting costs a spurious listing entry or
+ * ref (harmless — a ref with no matching document does nothing), while
+ * omitting a ref that ingest actually indexed causes the next reconcile
+ * pass to silently archive a live document (reconcile's missing-ref
+ * contract reads an omission as an upstream deletion).
+ */
+function shortcutIgnoreIsDefinite(route: DriveRoute, targetMime: string): boolean {
+  if (route.kind !== 'ignore') return false;
+  if (targetMime.startsWith('application/vnd.google-apps.')) return true;
+  return route.reason === 'archive' || route.reason === 'cloud-media';
+}
+
+/**
  * Budgeted recursive BFS file count behind the picker's per-row "N files".
  * Each files.list PAGE spends one request of the budget; folders enqueue,
  * and a non-folder counts only when `chooseRoute` would actually index it —
@@ -278,14 +311,20 @@ export async function countFilesUnder(
           const size = Number(f.size);
           // A shortcut's own name says nothing about the TARGET's extension
           // (e.g. a shortcut named "song.mp3" pointing at a real PDF) — pass
-          // '' so chooseRoute's extension-rescue branch never fires on it;
-          // only the resolved target mime decides.
+          // '' so chooseRoute's extension-rescue branch never fires on the
+          // wrong (shortcut's) name; only the resolved target mime decides.
+          // An 'unsupported' verdict reached that way is ambiguous — see
+          // shortcutIgnoreIsDefinite — so a shortcut is only excluded when
+          // the ignore is definite; count it (over-admit) otherwise.
           const route = chooseRoute(
             targetMime,
             isShortcut ? '' : f.name,
             Number.isFinite(size) ? size : undefined,
           );
-          if (route.kind === 'ignore') continue;
+          const ignored = isShortcut
+            ? shortcutIgnoreIsDefinite(route, targetMime)
+            : route.kind === 'ignore';
+          if (ignored) continue;
           if (++counted >= COUNT_CAP) return { count: counted, capped: true };
         }
         pageToken = page.nextPageToken;
@@ -1087,8 +1126,13 @@ export function createGoogleDocsSource(
               // (target mime only), then gated the same as an ordinary file.
               // The shortcut's OWN name is never passed here: a shortcut
               // named "song.mp3" pointing at a real PDF must not trip the
-              // extension-rescue branch on the wrong file's name.
-              if (chooseRoute(details.targetMimeType, '').kind === 'ignore') continue;
+              // extension-rescue branch on the wrong file's name. But an
+              // 'unsupported' verdict reached that way is ambiguous — see
+              // shortcutIgnoreIsDefinite — so only a DEFINITE ignore is
+              // omitted here; an ambiguous one is over-admitted (a phantom
+              // ref costs nothing; an omitted one gets archived next pass).
+              const shortcutRoute = chooseRoute(details.targetMimeType, '');
+              if (shortcutIgnoreIsDefinite(shortcutRoute, details.targetMimeType)) continue;
               refs.push({
                 externalId: details.targetId,
                 type: details.targetMimeType === GOOGLE_DOC_MIME ? 'gdocs.doc' : 'file',

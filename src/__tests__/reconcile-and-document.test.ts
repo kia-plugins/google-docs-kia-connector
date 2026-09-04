@@ -48,6 +48,13 @@ describe('reconcile', () => {
           // A shortcut whose target is itself ignored (cloud-media) — the
           // target mime alone decides, no target fetch needed.
           shortcut('sc3', 'Song link', 'TD3', 'audio/mpeg'),
+          // A shortcut whose target mime is generic (octet-stream): reconcile
+          // never learns the target's real name/extension, so it cannot rule
+          // out the SDK's extension-rescue branch (e.g. a '.pdf' name) that
+          // ingest's buildItem WOULD see and apply once it resolves the
+          // target. This ambiguous case must be over-admitted, not omitted —
+          // see Finding 1 / shortcutIgnoreIsDefinite.
+          shortcut('sc4', 'Ambiguous link', 'TD4', 'application/octet-stream'),
         ],
         S: [gdoc('docC', 'Doc C', { parents: ['S'] })],
       },
@@ -61,12 +68,35 @@ describe('reconcile', () => {
         { externalId: 'docA', type: 'gdocs.doc' },
         { externalId: 'pdfB', type: 'file' },
         { externalId: 'TD1', type: 'gdocs.doc' },
+        { externalId: 'TD4', type: 'file' },
       ],
       [{ externalId: 'docC', type: 'gdocs.doc' }],
     ]);
-    // Ref typing comes from shortcutDetails.targetMimeType — no target fetch.
+    // Ref typing comes from shortcutDetails.targetMimeType — no target fetch,
+    // for either a definite or an over-admitted ambiguous verdict.
     expect(calls.some((u) => u.includes('/files/TD1'))).toBe(false);
     expect(calls.some((u) => u.includes('/files/TD3'))).toBe(false);
+    expect(calls.some((u) => u.includes('/files/TD4'))).toBe(false);
+  });
+
+  it('over-admits (does not omit) a shortcut whose ambiguous-unsupported target ingest would actually index, so a later reconcile pass never archives it', async () => {
+    // Same shortcut ingest indexes in the delta suite ("extension rescue")
+    // — but a listing gives reconcile only the target's mime, never its
+    // name, so it cannot itself apply the rescue. It must still emit the
+    // ref: the SDK's reconcile contract reads a missing ref as an upstream
+    // deletion, and archiving a document ingest just indexed would be data
+    // loss with no error.
+    const { source, calls } = makeSource({
+      lists: {
+        root: [shortcut('sc1', 'Scan link', 'scan-target', 'application/octet-stream')],
+      },
+    });
+    const { session } = makeSession();
+
+    const pages = await collect(source.reconcile!(session));
+
+    expect(pages).toEqual([[{ externalId: 'scan-target', type: 'file' }]]);
+    expect(calls.some((u) => u.includes('scan-target'))).toBe(false);
   });
 
   it('multi-root: lists every root; an overlapping subtree (root inside root) is listed once', async () => {
