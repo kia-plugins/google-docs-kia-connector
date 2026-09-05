@@ -227,14 +227,21 @@ describe('manageFolders', () => {
   });
 
   it("retaining the 'root' catch-all archives NOTHING — the Save-path half of R6's 314-of-316 fix", async () => {
-    // DECISIONS R6 + R8's Drive rule. My Drive is a genuine ancestor of its
-    // whole subtree, so 'root' covers FOLD1: the covering set collapses to
-    // ['root'] AND the archive set is [] — even though FOLD1 was "removed"
-    // from folderRoots. Core set-differencing here would archive every live
-    // row (314 of 316 on the real production account, all of them frozen at
-    // historical folder ids by hashSkip). The alias must also be resolved to
-    // the REAL My Drive id before any walk: every descendant's parent chain
-    // ends at MYDRIVE, never at the literal string 'root'.
+    // DECISIONS R6 + R8's Drive rule, for the case where it holds: FOLD1 is
+    // really a My Drive folder, so the walk finds MYDRIVE and 'root' really
+    // does cover it. The covering set collapses to ['root'] AND the archive
+    // set is [] — even though FOLD1 was "removed" from folderRoots. Core
+    // set-differencing here would archive every live row (314 of 316 on the
+    // real production account, all of them frozen at historical folder ids
+    // by hashSkip). The alias must also be resolved to the REAL My Drive id
+    // before any walk: every descendant's parent chain ends at MYDRIVE,
+    // never at the literal string 'root'.
+    //
+    // NOT a general rule — C-46/D2. "The catch-all is retained" does NOT by
+    // itself mean "archive nothing"; a shared-with-me root in the same
+    // selection is under no My Drive folder. The containment suite below
+    // covers that, and FOLD1's rows here are RE-ATTRIBUTED to 'root' rather
+    // than left stamped FOLD1 forever.
     const { fetchFn, calls } = driveFetch(world);
     const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
     const { session } = makeSession({
@@ -252,6 +259,7 @@ describe('manageFolders', () => {
 
     expect(update.config).toEqual({ folderRoots: [{ id: 'root', name: 'My Drive' }] });
     expect(update.archiveScopeRootIds).toEqual([]);
+    expect(update.reattributeScopeRoots).toEqual([{ from: 'FOLD1', to: 'root' }]);
     expect(update.archiveNullScoped).toBe(true);
     expect(update.cursor).toEqual({
       page_token: 'pt-keep',
@@ -280,7 +288,10 @@ describe('manageFolders', () => {
     const update = await source.manageFolders!(session, channel);
 
     // An explicit IN-list for core: archive FOLD2's rows, nothing else.
+    // FOLD2 is a SIBLING of FOLD1 under My Drive (world fixture), so the
+    // ancestor walk proves no retained root covers it.
     expect(update.archiveScopeRootIds).toEqual(['FOLD2']);
+    expect(update.reattributeScopeRoots).toEqual([]);
     expect(update.archiveNullScoped).toBe(true);
     expect(update.cursor).toEqual({
       page_token: 'pt-keep',
@@ -381,6 +392,188 @@ describe('manageFolders', () => {
     await expect(source.manageFolders!(session, gone.channel)).rejects.toThrow(
       /folder "Deleted plans" is no longer readable/,
     );
+  });
+});
+
+/**
+ * C-46/D2 + D5. `archiveScopeRootIds = scopeRoots.includes('root') ? [] :
+ * removed` suppressed ALL archival whenever the My Drive catch-all was
+ * retained, on the premise that "My Drive is a genuine ancestor of every
+ * removed root's subtree". That premise is false: My Drive and "Shared with
+ * me" are MODES of one multi-select picker (source.ts:1208-1213), so a
+ * shared-with-me / shared-drive root sits in the same selection and is under
+ * no My Drive folder at all. Removing one archived nothing and left its
+ * documents searchable forever — `hashSkip` freezes a live row's
+ * `scope_root_id`, so no later walk re-stamps or removes it.
+ *
+ * The fix is a REAL containment decision per removed root, and D5's third
+ * verb for the covered case: re-attribution, so widening a selection costs
+ * one UPDATE instead of a re-download plus a searchability gap.
+ */
+describe('manageFolders — C-46/D2 containment of removed roots', () => {
+  const world = {
+    rootId: 'MYDRIVE',
+    gets: {
+      MYDRIVE: folder('MYDRIVE', 'My Drive', { parents: [] }),
+      FOLD1: folder('FOLD1', 'Projects', { parents: ['MYDRIVE'] }),
+      FOLD2: folder('FOLD2', 'Specs', { parents: ['FOLD1'] }),
+      // A shared-with-me root: readable, but its parent chain terminates
+      // immediately — there is no walkable path into this user's My Drive.
+      SHARED1: folder('SHARED1', 'Team specs', { parents: [] }),
+      // Gone upstream: 404 is a definitive "not covered".
+      GONE1: jsonRes(404, { error: { code: 404, message: 'File not found: GONE1.' } }),
+      // Transient failure that survives the retry ladder: never guessable.
+      BOOM: jsonRes(500, { error: { code: 500, message: 'Internal Error' } }),
+    },
+  };
+
+  const run = async (
+    stored: { id: string; name: string }[],
+    picked: { id: string; name: string; hasChildren: boolean }[],
+  ) => {
+    const { fetchFn, calls } = driveFetch(world);
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({
+      config: { folderRoots: stored },
+      cursor: {
+        page_token: 'pt-keep',
+        backfill_done: true,
+        scope_roots: [...new Set(stored.map((r) => r.id))].sort(),
+      },
+    });
+    const { channel } = makeFolderChannel({ picked });
+    return { source, session, channel, calls };
+  };
+
+  it('removing a SHARED root while My Drive is retained ARCHIVES it (D2)', async () => {
+    // The defect, exactly. 'root' is retained, so the old shortcut returned
+    // [] and SHARED1's rows stayed live and searchable with no root that
+    // selects them.
+    const { source, session, channel } = await run(
+      [
+        { id: 'root', name: 'My Drive' },
+        { id: 'SHARED1', name: 'Team specs' },
+      ],
+      [{ id: 'root', name: 'My Drive', hasChildren: true }],
+    );
+
+    const update = await source.manageFolders!(session, channel);
+
+    expect(update.archiveScopeRootIds).toEqual(['SHARED1']);
+    expect(update.reattributeScopeRoots).toEqual([]);
+  });
+
+  it('removing a My Drive subfolder RE-ATTRIBUTES it to the retained catch-all (D5)', async () => {
+    // The adjacent leak. Archiving would be correct-but-expensive (a full
+    // re-download of the subtree plus a window where the documents are not
+    // searchable); saying nothing freezes the stale FOLD1 stamp forever,
+    // and a later save that removes 'root' would not match those rows
+    // either. `to` is the CONFIG-FACING id — 'root', not MYDRIVE — because
+    // that is what folderRoots stores and what scope_root_id must match.
+    const { source, session, channel } = await run(
+      [
+        { id: 'root', name: 'My Drive' },
+        { id: 'FOLD1', name: 'Projects' },
+      ],
+      [{ id: 'root', name: 'My Drive', hasChildren: true }],
+    );
+
+    const update = await source.manageFolders!(session, channel);
+
+    expect(update.reattributeScopeRoots).toEqual([{ from: 'FOLD1', to: 'root' }]);
+    expect(update.archiveScopeRootIds).toEqual([]);
+  });
+
+  it('re-attributes to a nested retained ancestor, not just to the catch-all', async () => {
+    // FOLD2 sits under FOLD1, which stays selected. `kept` is a COVERING
+    // set, so at most one retained root can be an ancestor of a removed
+    // one — `to` is never ambiguous.
+    const { source, session, channel } = await run(
+      [
+        { id: 'FOLD1', name: 'Projects' },
+        { id: 'FOLD2', name: 'Specs' },
+      ],
+      [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+    );
+
+    const update = await source.manageFolders!(session, channel);
+
+    expect(update.reattributeScopeRoots).toEqual([{ from: 'FOLD2', to: 'FOLD1' }]);
+    expect(update.archiveScopeRootIds).toEqual([]);
+  });
+
+  it('archives the CONFIG-FACING id when the catch-all itself is removed', async () => {
+    // Narrowing away from My Drive. The alias resolves to MYDRIVE only to
+    // walk; MYDRIVE has no parents, so nothing retained covers it. The
+    // archived id must be 'root' — the string those rows are stamped with —
+    // never the resolved real id.
+    const { source, session, channel } = await run(
+      [{ id: 'root', name: 'My Drive' }],
+      [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+    );
+
+    const update = await source.manageFolders!(session, channel);
+
+    expect(update.archiveScopeRootIds).toEqual(['root']);
+    expect(update.reattributeScopeRoots).toEqual([]);
+  });
+
+  it('treats a 404 removed root as gone → not covered → archived', async () => {
+    const { source, session, channel } = await run(
+      [
+        { id: 'root', name: 'My Drive' },
+        { id: 'GONE1', name: 'Deleted plans' },
+      ],
+      [{ id: 'root', name: 'My Drive', hasChildren: true }],
+    );
+
+    const update = await source.manageFolders!(session, channel);
+
+    expect(update.archiveScopeRootIds).toEqual(['GONE1']);
+    expect(update.reattributeScopeRoots).toEqual([]);
+  });
+
+  it('ABORTS the save when containment cannot be determined (5xx after retries)', async () => {
+    // Never guessed. Guessing "covered" leaks documents outside the
+    // selection; guessing "not covered" archives documents the user still
+    // selects. The only honest answer is to fail the save, named, and let
+    // the user retry.
+    const { source, session, channel } = await run(
+      [
+        { id: 'root', name: 'My Drive' },
+        { id: 'BOOM', name: 'Flaky folder' },
+      ],
+      [{ id: 'root', name: 'My Drive', hasChildren: true }],
+    );
+
+    await expect(source.manageFolders!(session, channel)).rejects.toThrow(
+      /folder "Flaky folder".*nothing was saved/s,
+    );
+  });
+
+  it('keeps the two arrays DISJOINT and resolves the alias exactly once', async () => {
+    // applyFolderScope THROWS when a `from` also appears in
+    // archiveScopeRootIds (C-46/D5) — a source that says both about one
+    // root has a bug. Every removed root lands in exactly one array.
+    const { source, session, channel, calls } = await run(
+      [
+        { id: 'root', name: 'My Drive' },
+        { id: 'FOLD1', name: 'Projects' },
+        { id: 'SHARED1', name: 'Team specs' },
+        { id: 'GONE1', name: 'Deleted plans' },
+      ],
+      [{ id: 'root', name: 'My Drive', hasChildren: true }],
+    );
+
+    const update = await source.manageFolders!(session, channel);
+
+    expect(update.archiveScopeRootIds.sort()).toEqual(['GONE1', 'SHARED1']);
+    expect(update.reattributeScopeRoots).toEqual([{ from: 'FOLD1', to: 'root' }]);
+    const froms = update.reattributeScopeRoots!.map((r) => r.from);
+    expect(froms.filter((f) => update.archiveScopeRootIds.includes(f))).toEqual([]);
+    // One shared resolution for the whole save — coveringRoots and the
+    // containment pass share it.
+    expect(calls.filter((u) => u.includes('/files/root'))).toHaveLength(1);
   });
 });
 

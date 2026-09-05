@@ -856,6 +856,34 @@ async function folderInfo(
 }
 
 /**
+ * One save's shared folder-resolution state: the shallow-lookup cache and a
+ * memoized `'root'` → real My Drive id. `coveringRoots` and
+ * `classifyRemovedRoots` run back to back on the SAME modal, walk the same
+ * chains, and would otherwise re-fetch `files/root` and every shared
+ * ancestor a second time.
+ */
+export interface ScopeResolver {
+  index: FolderIndex;
+  /** The REAL folder id behind the `'root'` alias, fetched at most once. */
+  myDriveId(): Promise<string>;
+}
+
+export function makeScopeResolver(client: DriveClient): ScopeResolver {
+  const index: FolderIndex = new Map();
+  let real: string | null = null;
+  return {
+    index,
+    async myDriveId() {
+      if (real === null) {
+        const r = await client.request<{ id: string }>(`${DRIVE_API}/files/root?fields=id`);
+        real = r.id;
+      }
+      return real;
+    },
+  };
+}
+
+/**
  * Collapse a picked set to a COVERING set: drop any node whose first-parent
  * chain reaches another picked node. Two Drive-specific rules:
  *
@@ -880,16 +908,12 @@ async function folderInfo(
 export async function coveringRoots(
   picked: FolderNode[],
   client: DriveClient,
+  resolver: ScopeResolver = makeScopeResolver(client),
 ): Promise<FolderNode[]> {
-  const index: FolderIndex = new Map();
+  const index = resolver.index;
   const realId = new Map<string, string>();
   for (const n of picked) {
-    if (n.id === 'root') {
-      const r = await client.request<{ id: string }>(`${DRIVE_API}/files/root?fields=id`);
-      realId.set(n.id, r.id);
-    } else {
-      realId.set(n.id, n.id);
-    }
+    realId.set(n.id, n.id === 'root' ? await resolver.myDriveId() : n.id);
   }
   const selected = new Set(realId.values());
 
@@ -933,6 +957,125 @@ export async function coveringRoots(
     kept.push(n);
   }
   return kept;
+}
+
+/** A removed root's fate: its documents stay in scope under a retained
+ *  ancestor (`reattribute`), or they leave scope entirely (`archive`). The
+ *  two arrays are DISJOINT by construction — every removed root is pushed to
+ *  exactly one of them — which is what `applyFolderScope` throws over
+ *  (C-46/D5). */
+export interface RemovedRootPlan {
+  archive: string[];
+  reattribute: Array<{ from: string; to: string }>;
+}
+
+/**
+ * C-46/D2 + D5. Decide, per REMOVED root, whether a RETAINED root still
+ * covers it — a real ancestor walk, never a heuristic.
+ *
+ * This replaces `scopeRoots.includes('root') ? [] : removed`, whose premise
+ * ("My Drive is a genuine ancestor of every removed root's subtree") is
+ * false: My Drive and "Shared with me" are MODES of ONE multi-select picker
+ * (`manageFolders` below), so a shared-with-me or shared-drive root lives in
+ * the same selection and is under no My Drive folder at all. Removing one
+ * archived nothing, and `hashSkip` (:476) freezes a live row's
+ * `scope_root_id`, so no later walk ever re-stamped or removed it — the
+ * documents stayed searchable forever.
+ *
+ * Ids in and out are CONFIG-FACING (`folderRoots[].id`), the exact strings
+ * `scope_root_id` carries: the `'root'` alias is resolved only to walk, and
+ * `to` is the retained root's alias, never the resolved My Drive id.
+ * `kept` is a COVERING set, so at most one retained root can be an ancestor
+ * of any removed root — `to` is never ambiguous.
+ *
+ * Failure policy, matching OneDrive's `resolveRootLocation`:
+ *  - auth error → rethrow; every later call would fail identically.
+ *  - 404/410, on the root itself or anywhere up its chain → the folder (or
+ *    the chain) is gone, so nothing retained demonstrably covers it →
+ *    archive. Archival is the RECOVERABLE direction here: the root set
+ *    changed, so this save also forces a re-establish, and an archived row
+ *    is re-emitted by the re-walk through hashSkip's archived-row exception
+ *    (:476).
+ *  - anything else (5xx after the retry ladder, network) → THROW and abort
+ *    the save, named. Guessing "covered" leaks documents outside the
+ *    selection; guessing "not covered" archives documents the user still
+ *    selects. Neither is guessable, so neither is guessed.
+ * A cycle or MAX_ANCESTOR_HOPS exhaustion is likewise "no coverage proven"
+ * → archive, on the same recoverability argument.
+ */
+export async function classifyRemovedRoots(
+  removed: { id: string; name: string }[],
+  kept: FolderNode[],
+  client: DriveClient,
+  resolver: ScopeResolver,
+): Promise<RemovedRootPlan> {
+  const plan: RemovedRootPlan = { archive: [], reattribute: [] };
+  if (removed.length === 0) return plan;
+
+  // real folder id → the retained root's CONFIG-FACING id.
+  const retainedByReal = new Map<string, string>();
+  for (const n of kept) {
+    retainedByReal.set(n.id === 'root' ? await resolver.myDriveId() : n.id, n.id);
+  }
+
+  for (const r of removed) {
+    const own = r.id === 'root' ? await resolver.myDriveId() : r.id;
+
+    // The same root under both spellings (an explicit My Drive id stored,
+    // the alias retained, or vice versa): pure re-attribution, no walk.
+    const self = retainedByReal.get(own);
+    if (self !== undefined) {
+      if (self !== r.id) plan.reattribute.push({ from: r.id, to: self });
+      continue;
+    }
+
+    const gone = (e: unknown): boolean =>
+      e instanceof DriveApiError && (e.status === 404 || e.status === 410);
+    const abort = (e: unknown): Error =>
+      new Error(
+        `google-docs: could not determine whether folder "${r.name}" is still covered by your selection (${errText(e)}) — nothing was saved; try again`,
+      );
+
+    let info: { name: string; parents: string[] };
+    try {
+      info = await folderInfo(own, resolver.index, client);
+    } catch (e) {
+      if (isAuthError(e)) throw e;
+      if (!gone(e)) throw abort(e);
+      plan.archive.push(r.id);
+      continue;
+    }
+
+    let current = info.parents[0];
+    const visited = new Set<string>([own]);
+    let to: string | undefined;
+    let aborted: unknown;
+    for (let hops = 0; hops < MAX_ANCESTOR_HOPS && current; hops++) {
+      const hit = retainedByReal.get(current);
+      if (hit !== undefined) {
+        to = hit;
+        break;
+      }
+      if (visited.has(current)) break; // cycle
+      visited.add(current);
+      let ancestor: { name: string; parents: string[] };
+      try {
+        ancestor = await folderInfo(current, resolver.index, client);
+      } catch (e) {
+        if (isAuthError(e)) throw e;
+        if (!gone(e)) {
+          aborted = e;
+          break;
+        }
+        break; // chain gone → no coverage proven → archive
+      }
+      current = ancestor.parents[0];
+    }
+    if (aborted !== undefined) throw abort(aborted);
+    if (to !== undefined) plan.reattribute.push({ from: r.id, to });
+    else plan.archive.push(r.id);
+  }
+  return plan;
 }
 
 /** Both-type existence probe for query-first deletions: only refs for types
@@ -1230,28 +1373,49 @@ export function createGoogleDocsSource(
       if (picked.length === 0) throw new Error('google-docs: no folders selected');
 
       channel.status('Checking the selection…');
-      const kept = await coveringRoots(picked, client);
+      const resolver = makeScopeResolver(client);
+      const kept = await coveringRoots(picked, client, resolver);
       const folderRoots = kept.map((n) => ({ id: n.id, name: n.name }));
       const scopeRoots = [...new Set(folderRoots.map((r) => r.id))].sort();
 
-      // DECISIONS R8, Drive rule. Core cannot compute this: it does not know
-      // containment, and every live row's scope_root_id is frozen by
-      // hashSkip at whatever root claimed it when last emitted (314 rows over
-      // 24 distinct historical ids on the real production account). So:
-      //   - if a retained root is the catch-all 'root', My Drive is a
-      //     genuine ancestor of every removed root's subtree → archive
-      //     NOTHING. This is the Save-path half of R6's 314-of-316 fix, and
-      //     it is what stops a WIDENING edit from emptying the corpus.
-      //   - otherwise the removed root ids, as an explicit IN-list. A root
-      //     removed but still covered by a retained NON-catch-all ancestor
-      //     is archived and then un-archived by the forced re-walk below;
-      //     reconcile() remains the net for anything genuinely orphaned.
+      // DECISIONS R8, Drive rule — REWRITTEN by C-46/D2 + D5. Core cannot
+      // compute this: it does not know containment, and every live row's
+      // scope_root_id is frozen by hashSkip at whatever root claimed it when
+      // last emitted (314 rows over 24 distinct historical ids on the real
+      // production account).
+      //
+      // This block used to read `scopeRoots.includes('root') ? [] : removed`
+      // — "if the My Drive catch-all is retained it is a genuine ancestor of
+      // every removed root's subtree, so archive NOTHING". That premise is
+      // FALSE. My Drive and "Shared with me" are `modes` of ONE
+      // multiSelect picker (see pickFolders above), not an either/or, so a
+      // shared-with-me or shared-drive root sits in the same selection and is
+      // under no My Drive folder at all. Removing one archived nothing and
+      // left its documents searchable forever, with no root that selects
+      // them and no walk that would ever re-stamp or remove them.
+      //
+      // So every removed root now gets a REAL ancestor walk
+      // (classifyRemovedRoots), and lands in exactly one of two arrays:
+      //   - covered by a retained root → `reattributeScopeRoots`, C-46/D5's
+      //     third verb: core re-stamps scope_root_id from → to in the same
+      //     transaction. No archive, no re-download, no searchability gap
+      //     and no stale stamp — which is what keeps a WIDENING edit (the
+      //     single most likely edit, de-selecting a folder in favour of My
+      //     Drive) cheap. This is the Save-path half of R6's 314-of-316 fix.
+      //   - not covered (a shared root, or genuinely orphaned) →
+      //     `archiveScopeRootIds`, an explicit IN-list; reconcile() remains
+      //     the net for anything else.
+      // The two are disjoint by construction — applyFolderScope THROWS
+      // otherwise. Containment that cannot be DETERMINED aborts the save
+      // rather than being guessed; see classifyRemovedRoots' failure policy.
       // The alias is the only way a catch-all can enter folderRoots — the
-      // picker's My Drive tab always yields { id: 'root' }.
+      // picker's My Drive tab always yields { id: 'root' } — and it is what
+      // both arrays carry, since that is the string scope_root_id holds.
       const removed = current
-        .map((r) => r.rootFolderId)
-        .filter((id) => !scopeRoots.includes(id));
-      const archiveScopeRootIds = scopeRoots.includes('root') ? [] : removed;
+        .filter((r) => !scopeRoots.includes(r.rootFolderId))
+        .map((r) => ({ id: r.rootFolderId, name: r.rootName }));
+      const { archive: archiveScopeRootIds, reattribute: reattributeScopeRoots } =
+        await classifyRemovedRoots(removed, kept, client, resolver);
 
       // Unrelated config keys ride through untouched (spec §Terminology),
       // and that includes the legacy `roots` mirror: DECISIONS A-2 gives
@@ -1320,6 +1484,7 @@ export function createGoogleDocsSource(
         config: { ...stored, folderRoots },
         cursor,
         archiveScopeRootIds,
+        reattributeScopeRoots,
         archiveNullScoped: rewalk,
       };
     },
