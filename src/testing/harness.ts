@@ -19,6 +19,7 @@ import type {
   Document,
   FolderNode,
   FolderPickerSpec,
+  FolderSelectionChannel,
   HostFor,
   Query,
   Session,
@@ -26,6 +27,7 @@ import type {
 import type { HostResponse } from '@kiagent/connector-sdk/http';
 import {
   fakeAuthChannel,
+  fakeFolderSelectionChannel,
   fakeSession,
   instantClock,
   jsonRes,
@@ -260,6 +262,7 @@ export function makeSession(
   opts: {
     creds?: Credentials | null;
     config?: Record<string, unknown>;
+    cursor?: unknown;
     signal?: AbortSignal;
   } = {},
 ): { session: Session; logs: { level: string; msg: string }[] } {
@@ -270,7 +273,7 @@ export function makeSession(
       source: 'google-docs',
       identifier: 'user@example.com',
       config: opts.config ?? {},
-      cursor: null,
+      cursor: opts.cursor ?? null,
     },
     credentials: opts.creds === undefined ? { accessToken: 'ya29.test-deadbeef' } : opts.creds,
     signal: opts.signal,
@@ -324,6 +327,30 @@ export function makeAuth(
   };
 }
 
+/** The narrow manage-folders channel (SDK kit fake) plus recorders for what
+ *  `manageFolders` asked the picker for — the FolderSelectionChannel sibling
+ *  of `makeAuth`. Single adapter point: if the kit's fake signature moves,
+ *  only this function changes. */
+export function makeFolderChannel(
+  opts: {
+    picked?: FolderNode[] | ((spec: FolderPickerSpec) => Promise<FolderNode[]>);
+  } = {},
+): {
+  channel: FolderSelectionChannel;
+  statuses: string[];
+  getPickerSpec: () => FolderPickerSpec | undefined;
+} {
+  let pickerSpec: FolderPickerSpec | undefined;
+  const channel = fakeFolderSelectionChannel({
+    pickFolders: async (spec) => {
+      pickerSpec = spec;
+      if (typeof opts.picked === 'function') return opts.picked(spec);
+      return opts.picked ?? [];
+    },
+  });
+  return { channel, statuses: channel.statuses, getPickerSpec: () => pickerSpec };
+}
+
 export function fakeDoc(
   externalId: string,
   type: string,
@@ -343,6 +370,7 @@ export function fakeDoc(
     contentHash: 'hash-x',
     seq: 1,
     archivedAt: null,
+    scopeRootId: null,
     languages: [],
     ingestedAt: '2026-01-01T00:00:00Z',
     updatedAt: '2026-01-01T00:00:00Z',

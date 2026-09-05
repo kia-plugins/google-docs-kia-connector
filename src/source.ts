@@ -25,6 +25,7 @@
  *    always propagate.
  */
 import type {
+  Account,
   AuthChannel,
   Batch,
   Credentials,
@@ -34,6 +35,8 @@ import type {
   FileIgnoreReason,
   FolderCount,
   FolderNode,
+  FolderScopeUpdate,
+  FolderSelectionChannel,
   HostFor,
   Query,
   Session,
@@ -832,6 +835,106 @@ async function resolveScope(
   return { inScope: false, segments: [] };
 }
 
+/** Shallow folder lookup with the per-call index as its cache — the same
+ *  `shallowUrl` + FolderIndex idiom `resolveScope` uses. */
+async function folderInfo(
+  id: string,
+  index: FolderIndex,
+  client: DriveClient,
+): Promise<{ name: string; parents: string[] }> {
+  const hit = index.get(id);
+  if (hit) return hit;
+  const f = await client.request<{
+    id: string;
+    name: string;
+    mimeType: string;
+    parents?: string[];
+  }>(shallowUrl(id));
+  const info = { name: f.name, parents: f.parents ?? [] };
+  index.set(id, info);
+  return info;
+}
+
+/**
+ * Collapse a picked set to a COVERING set: drop any node whose first-parent
+ * chain reaches another picked node. Two Drive-specific rules:
+ *
+ *  - the picker's My Drive tab hands back the literal alias `'root'`, which
+ *    is NOT a folder id — every My Drive descendant's chain terminates at
+ *    the REAL My Drive id — so the alias is resolved once, exactly as
+ *    `delta` does at :816-819, before any walk. Without that, "My Drive +
+ *    one of its subfolders" survives as two roots and that subtree is
+ *    walked and attributed twice.
+ *  - `'root'` is the catch-all (DECISIONS R6): nothing covers My Drive, so
+ *    it is never walked, and everything under it collapses INTO it.
+ *
+ * Failure policy follows the spec's error handling. A SELECTED folder that
+ * cannot be read at all is a validation failure the user must see, named.
+ * A failure part-way up an ANCESTOR chain keeps the root instead — over-
+ * covering costs one re-walked subtree, under-covering archives documents.
+ *
+ * Cost: N selected roots × up to MAX_ANCESTOR_HOPS shallow GETs, on a modal
+ * the user expects to be quick. Shared-with-me roots terminate immediately
+ * (no walkable chain into My Drive).
+ */
+export async function coveringRoots(
+  picked: FolderNode[],
+  client: DriveClient,
+): Promise<FolderNode[]> {
+  const index: FolderIndex = new Map();
+  const realId = new Map<string, string>();
+  for (const n of picked) {
+    if (n.id === 'root') {
+      const r = await client.request<{ id: string }>(`${DRIVE_API}/files/root?fields=id`);
+      realId.set(n.id, r.id);
+    } else {
+      realId.set(n.id, n.id);
+    }
+  }
+  const selected = new Set(realId.values());
+
+  const kept: FolderNode[] = [];
+  const seen = new Set<string>();
+  for (const n of picked) {
+    const own = realId.get(n.id)!;
+    if (seen.has(own)) continue; // the alias and the real id are ONE root
+    if (n.id !== 'root') {
+      let info: { name: string; parents: string[] };
+      try {
+        info = await folderInfo(own, index, client);
+      } catch (e) {
+        if (isAuthError(e)) throw e;
+        throw new Error(
+          `google-docs: folder "${n.name}" is no longer readable (${errText(e)}) — remove it from the selection or restore access, then save again`,
+        );
+      }
+      let current = info.parents[0];
+      const visited = new Set<string>([own]);
+      let covered = false;
+      for (let hops = 0; hops < MAX_ANCESTOR_HOPS && current; hops++) {
+        if (selected.has(current)) {
+          covered = true;
+          break;
+        }
+        if (visited.has(current)) break; // cycle
+        visited.add(current);
+        let ancestor: { name: string; parents: string[] };
+        try {
+          ancestor = await folderInfo(current, index, client);
+        } catch (e) {
+          if (isAuthError(e)) throw e;
+          break; // unreadable ancestor → keep this root; over-cover is safe
+        }
+        current = ancestor.parents[0];
+      }
+      if (covered) continue;
+    }
+    seen.add(own);
+    kept.push(n);
+  }
+  return kept;
+}
+
 /** Both-type existence probe for query-first deletions: only refs for types
  *  that actually exist locally are emitted. */
 async function existingRefs(
@@ -1005,6 +1108,9 @@ export function createGoogleDocsSource(
       auth: 'oauth',
       multiAccount: true,
       cadence: { every: '15m' },
+      /** Enables the Tracked folders card and accounts:start-manage-folders.
+       *  A descriptor with this flag MUST implement manageFolders. */
+      folderScope: true,
     },
 
     async connect(auth: AuthChannel) {
@@ -1029,22 +1135,6 @@ export function createGoogleDocsSource(
       }
       const email = about.user.emailAddress;
 
-      // Reconnect after an auth failure restores the stored selection: the
-      // picker opens BLANK (no preselection), so re-asking here invites a
-      // careless confirm that silently shrinks the corpus. The config rides
-      // back VERBATIM — legacy shapes (no explicit roots = all of My Drive)
-      // included. A healthy re-connect still runs the picker: it is the only
-      // way to change the selection; the engine upserts on
-      // (source, identifier) either way, so documents and cursor survive.
-      const prior = (await host.query.accounts()).find(
-        (a) =>
-          a.source === 'google-docs' && a.identifier === email && a.status === 'needsReauth',
-      );
-      if (prior) {
-        auth.status('Restoring previous folder selection…');
-        return { identifier: email, config: prior.config };
-      }
-
       // The platform's shared folder-picker: lazy tree over the connect-time
       // client, multi-select with covering roots. A user cancel rejects —
       // let that propagate out of connect().
@@ -1054,6 +1144,8 @@ export function createGoogleDocsSource(
           { key: 'shared', label: 'Shared with me' },
         ],
         multiSelect: true,
+        purpose: 'connect',
+        selected: [],
         roots: async (mode) =>
           mode === 'my-drive'
             ? [{ id: 'root', name: 'My Drive', hasChildren: true }]
@@ -1062,9 +1154,17 @@ export function createGoogleDocsSource(
         count: (id) => countFilesUnder(client, id),
       });
       if (picked.length === 0) throw new Error('google-docs: no folders selected');
+      // Canonical shape only. Core writes the legacy `roots` mirror where it
+      // is needed (DECISIONS R1 + A-2); an account created by THIS artifact
+      // implies this artifact is the installed one, so nothing here reads
+      // the mirror. Covering-set normalization is deliberately NOT run:
+      // the connect picker lists before it selects, so the renderer's own
+      // covering logic already collapsed the My Drive tab — running
+      // coveringRoots would add N ancestor walks to every first connect and
+      // would flip this suite's `calls).toHaveLength(1)` assertion.
       return {
-        identifier: about.user.emailAddress,
-        config: { roots: picked.map((n) => ({ rootFolderId: n.id, rootName: n.name })) },
+        identifier: email,
+        config: { folderRoots: picked.map((n) => ({ id: n.id, name: n.name })) },
       };
     },
 
@@ -1089,6 +1189,175 @@ export function createGoogleDocsSource(
         yield* withScopeRoots(
           delta(client, session, host.query, cursor, roots, budget),
           scopeRoots,
+        );
+      }
+    },
+
+    /**
+     * Edit this account's folder scope with its EXISTING credentials — never
+     * an OAuth round trip (the channel deliberately has no `oauth` verb).
+     * Persists nothing: core owns the durable transaction.
+     */
+    async manageFolders(
+      session: Session,
+      channel: FolderSelectionChannel,
+    ): Promise<FolderScopeUpdate<DriveCursor>> {
+      const client = clientFor(session);
+      const current = rootsConfig(session);
+      channel.status('Loading your Drive folders…');
+      const picked = await channel.pickFolders({
+        modes: [
+          { key: 'my-drive', label: 'My Drive' },
+          { key: 'shared', label: 'Shared with me' },
+        ],
+        multiSelect: true,
+        purpose: 'manage',
+        // Pre-checked AND removable. `hasChildren` is always true here for
+        // the same reason `listFolderNodes` sets it: probing would cost one
+        // API call per row.
+        selected: current.map((r) => ({
+          id: r.rootFolderId,
+          name: r.rootName,
+          hasChildren: true,
+        })),
+        roots: async (mode) =>
+          mode === 'my-drive'
+            ? [{ id: 'root', name: 'My Drive', hasChildren: true }]
+            : listSharedRoots(client),
+        children: (id) => listChildFolders(client, id),
+        count: (id) => countFilesUnder(client, id),
+      });
+      if (picked.length === 0) throw new Error('google-docs: no folders selected');
+
+      channel.status('Checking the selection…');
+      const kept = await coveringRoots(picked, client);
+      const folderRoots = kept.map((n) => ({ id: n.id, name: n.name }));
+      const scopeRoots = [...new Set(folderRoots.map((r) => r.id))].sort();
+
+      // DECISIONS R8, Drive rule. Core cannot compute this: it does not know
+      // containment, and every live row's scope_root_id is frozen by
+      // hashSkip at whatever root claimed it when last emitted (314 rows over
+      // 24 distinct historical ids on the real production account). So:
+      //   - if a retained root is the catch-all 'root', My Drive is a
+      //     genuine ancestor of every removed root's subtree → archive
+      //     NOTHING. This is the Save-path half of R6's 314-of-316 fix, and
+      //     it is what stops a WIDENING edit from emptying the corpus.
+      //   - otherwise the removed root ids, as an explicit IN-list. A root
+      //     removed but still covered by a retained NON-catch-all ancestor
+      //     is archived and then un-archived by the forced re-walk below;
+      //     reconcile() remains the net for anything genuinely orphaned.
+      // The alias is the only way a catch-all can enter folderRoots — the
+      // picker's My Drive tab always yields { id: 'root' }.
+      const removed = current
+        .map((r) => r.rootFolderId)
+        .filter((id) => !scopeRoots.includes(id));
+      const archiveScopeRootIds = scopeRoots.includes('root') ? [] : removed;
+
+      // Unrelated config keys ride through untouched (spec §Terminology),
+      // and that includes the legacy `roots` mirror: DECISIONS A-2 gives
+      // core sole ownership of it — applyFolderScope re-derives it from
+      // folderRoots inside the same transaction. This connector neither
+      // writes it nor strips it. Stripping it would silently end R1's
+      // one-train compatibility window on a still-installed 2.1.6.
+      const stored = session.account.config as Record<string, unknown>;
+
+      const prior = (session.account.cursor ?? null) as DriveCursor | null;
+      const rewalk = prior !== null && !sameRootSet(prior.scope_roots, scopeRoots);
+      const cursor: DriveCursor | null = prior
+        ? {
+            // The pre-change token is a SUPERSET of the changes the new walk
+            // could miss, so it is preserved — backfill's own comment is the
+            // guarantee this leans on: "A non-empty saved page_token
+            // predates the interrupted walk — a superset of the changes we
+            // might miss — so KEEP it; never recapture mid-backfill."
+            // (source.ts:634-635)
+            page_token: prior.page_token,
+            backfill_done: rewalk ? false : prior.backfill_done,
+            scope_roots: scopeRoots,
+          }
+        : null;
+
+      // DECISIONS A-3/R5. NULL-scoped live rows exist on a Drive account
+      // only via the migration (Task 2's mass-archive refusal and its
+      // unreadable-metadata/config guards deliberately leave rows live with
+      // scope_root_id NULL); this connector never EMITS one. Archiving them
+      // is repairable ONLY when the same update forces a full re-establish,
+      // because contentHash excludes scope and this connector hashSkips —
+      // the re-walk un-archives them through hashSkip's archived-row
+      // exception (source.ts:476). So the flag rides exactly the branch that
+      // sets backfill_done:false with the page_token preserved, and is false
+      // whenever the root set is unchanged or there is no cursor to re-walk.
+      //
+      // ⚠️ C-34 — CORE DECLINES TO ACT ON THIS FLAG IN THIS TRAIN, BY
+      // DESIGN. Keep emitting it: it is part of the frozen
+      // `FolderScopeUpdate` and it is how a source states intent. But expect
+      // NO effect — Task 3 drops `archiveNullScoped` from
+      // `applyFolderScope`'s store input type and Task 7 does not forward it
+      // (it warns that a source asked and was refused). Do not "fix" the
+      // connector when you discover the field is inert, and do not delete the
+      // computation: it records intent and is what a later, safe repair path
+      // would key on.
+      //
+      // Why core refuses the pairing this comment argues for: the archive
+      // would land BEFORE there is any proof the compensating re-walk
+      // actually LISTED the row. An archived row is genuinely re-emitted —
+      // hashSkip's `if (!existing || existing.archivedAt) return false;`
+      // exception (source.ts:476) is real — but only for rows the walk
+      // reaches, and a LIVE NULL-scoped row has no other re-stamp path at
+      // all, because core's upsertDocument early-returns on
+      // `content_hash === hash && archived_at === null`
+      // (write-tx.ts:170-176). So any row the re-walk misses, and every row
+      // on an account whose walk never runs (`needsReauth` is a RESTING
+      // state — boot.ts:194-202: only the user's explicit Retry or a fresh
+      // connect restarts the loop), stays archived for good. OneDrive is
+      // worse still: no `reconcile()` exists there at all
+      // (onedrive-kia-connector src/source.ts:62). What would have to exist
+      // before core could honour the flag is an archive-AFTER-proof
+      // predicate shaped like `reconcile`'s (`write-tx.ts:512-538`: `seq <=
+      // ?` AND `NOT EXISTS (… reconcile_listing …)`) — plus a listing pass
+      // for OneDrive — not a boolean.
+      return {
+        config: { ...stored, folderRoots },
+        cursor,
+        archiveScopeRootIds,
+        archiveNullScoped: rewalk,
+      };
+    },
+
+    /**
+     * Re-authenticate THIS account. Never touches config or the cursor —
+     * reconnect preserves scope byte-for-byte (spec invariant 2). The
+     * identity check is the whole point: without it an OAuth flow that
+     * lands on a different Google account would silently repoint an
+     * existing corpus. Trimmed and case-insensitive, per the spec; the old
+     * heuristic compared with a bare `===`.
+     */
+    async reauthenticate(account: Account, auth: AuthChannel): Promise<void> {
+      auth.status('Waiting for Google sign-in…');
+      const creds: Credentials = await auth.oauth(DRIVE_SCOPES);
+      const accessToken = creds.accessToken;
+      if (!accessToken) {
+        throw new Error('google-docs: Google sign-in returned no access token');
+      }
+      const client = new DriveClient({
+        fetch: host.net.fetch,
+        getToken: async () => accessToken,
+        ...clock,
+      });
+
+      auth.status('Verifying the Google account…');
+      const about = await client.request<{
+        user?: { emailAddress?: string; displayName?: string };
+      }>(`${DRIVE_API}/about?fields=user(emailAddress,displayName)`);
+      const email = about.user?.emailAddress;
+      if (!email) {
+        throw new Error('google-docs: Drive about response missing user.emailAddress');
+      }
+      const fold = (s: string): string => s.trim().toLowerCase();
+      if (fold(email) !== fold(account.identifier)) {
+        // Names both identities, never a token (spec §Error handling).
+        throw new Error(
+          `google-docs: signed in as ${email}, but this account is ${account.identifier} — sign in with the original Google account`,
         );
       }
     },

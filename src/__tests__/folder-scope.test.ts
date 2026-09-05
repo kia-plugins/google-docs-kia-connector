@@ -190,3 +190,298 @@ describe('pull() scope_roots mismatch check', () => {
     expect(second.calls.some((u) => u.includes('startPageToken'))).toBe(false);
   });
 });
+
+describe('manageFolders', () => {
+  const world = {
+    rootId: 'MYDRIVE',
+    gets: {
+      FOLD1: folder('FOLD1', 'Projects', { parents: ['MYDRIVE'] }),
+      FOLD2: folder('FOLD2', 'Specs', { parents: ['MYDRIVE'] }),
+      // Needed so a walk that does NOT hit a selected root terminates on
+      // `parents[0] === undefined` instead of on an unhandled-fixture throw
+      // that costs a full retry ladder and pins the wrong code path.
+      MYDRIVE: folder('MYDRIVE', 'My Drive', { parents: [] }),
+    },
+  };
+
+  it('opens the picker with purpose:manage and the CURRENT roots preselected', async () => {
+    const { fetchFn } = driveFetch(world);
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({
+      config: { folderRoots: [{ id: 'FOLD1', name: 'Projects' }] },
+    });
+    const { channel, getPickerSpec } = makeFolderChannel({
+      picked: [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+    });
+
+    await source.manageFolders!(session, channel);
+
+    const spec = getPickerSpec()!;
+    expect(spec.purpose).toBe('manage');
+    expect(spec.multiSelect).toBe(true);
+    expect(spec.selected).toEqual([{ id: 'FOLD1', name: 'Projects', hasChildren: true }]);
+    expect(spec.modes).toEqual([
+      { key: 'my-drive', label: 'My Drive' },
+      { key: 'shared', label: 'Shared with me' },
+    ]);
+  });
+
+  it("retaining the 'root' catch-all archives NOTHING — the Save-path half of R6's 314-of-316 fix", async () => {
+    // DECISIONS R6 + R8's Drive rule. My Drive is a genuine ancestor of its
+    // whole subtree, so 'root' covers FOLD1: the covering set collapses to
+    // ['root'] AND the archive set is [] — even though FOLD1 was "removed"
+    // from folderRoots. Core set-differencing here would archive every live
+    // row (314 of 316 on the real production account, all of them frozen at
+    // historical folder ids by hashSkip). The alias must also be resolved to
+    // the REAL My Drive id before any walk: every descendant's parent chain
+    // ends at MYDRIVE, never at the literal string 'root'.
+    const { fetchFn, calls } = driveFetch(world);
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({
+      config: { folderRoots: [{ id: 'FOLD1', name: 'Projects' }] },
+      cursor: { page_token: 'pt-keep', backfill_done: true, scope_roots: ['FOLD1'] },
+    });
+    const { channel } = makeFolderChannel({
+      picked: [
+        { id: 'root', name: 'My Drive', hasChildren: true },
+        { id: 'FOLD1', name: 'Projects', hasChildren: true },
+      ],
+    });
+
+    const update = await source.manageFolders!(session, channel);
+
+    expect(update.config).toEqual({ folderRoots: [{ id: 'root', name: 'My Drive' }] });
+    expect(update.archiveScopeRootIds).toEqual([]);
+    expect(update.archiveNullScoped).toBe(true);
+    expect(update.cursor).toEqual({
+      page_token: 'pt-keep',
+      backfill_done: false,
+      scope_roots: ['root'],
+    });
+    expect(calls.filter((u) => u.includes('/files/root'))).toHaveLength(1);
+  });
+
+  it('narrowing with NO catch-all retained archives exactly the removed root (R8)', async () => {
+    const { fetchFn } = driveFetch(world);
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({
+      config: {
+        folderRoots: [
+          { id: 'FOLD1', name: 'Projects' },
+          { id: 'FOLD2', name: 'Specs' },
+        ],
+      },
+      cursor: { page_token: 'pt-keep', backfill_done: true, scope_roots: ['FOLD1', 'FOLD2'] },
+    });
+    const { channel } = makeFolderChannel({
+      picked: [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+    });
+
+    const update = await source.manageFolders!(session, channel);
+
+    // An explicit IN-list for core: archive FOLD2's rows, nothing else.
+    expect(update.archiveScopeRootIds).toEqual(['FOLD2']);
+    expect(update.archiveNullScoped).toBe(true);
+    expect(update.cursor).toEqual({
+      page_token: 'pt-keep',
+      backfill_done: false,
+      scope_roots: ['FOLD1'],
+    });
+  });
+
+  it('an unchanged set archives nothing, leaves backfill_done alone, and is SILENT about the legacy mirror (A-2)', async () => {
+    const { fetchFn } = driveFetch(world);
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({
+      config: {
+        folderRoots: [{ id: 'FOLD1', name: 'Projects' }],
+        roots: [{ rootFolderId: 'FOLD1', rootName: 'Projects' }],
+        watch: true,
+      },
+      cursor: { page_token: 'pt-keep', backfill_done: true, scope_roots: ['FOLD1'] },
+    });
+    const { channel } = makeFolderChannel({
+      picked: [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+    });
+
+    const update = await source.manageFolders!(session, channel);
+
+    // Every stored key rides through. The legacy `roots` mirror is neither
+    // written nor stripped here (DECISIONS A-2: core owns it, and
+    // applyFolderScope re-derives it from folderRoots in the SAME
+    // transaction). A connector that deleted it would end R1's
+    // compatibility train on the first Save for a still-installed 2.1.6.
+    expect(update.config).toEqual({
+      watch: true,
+      roots: [{ rootFolderId: 'FOLD1', rootName: 'Projects' }],
+      folderRoots: [{ id: 'FOLD1', name: 'Projects' }],
+    });
+    expect(update.archiveScopeRootIds).toEqual([]);
+    expect(update.archiveNullScoped).toBe(false);
+    expect(update.cursor).toEqual({
+      page_token: 'pt-keep',
+      backfill_done: true,
+      scope_roots: ['FOLD1'],
+    });
+  });
+
+  it('archiveNullScoped is true ONLY together with a forced re-establish (A-3)', async () => {
+    const prior: DriveCursor = {
+      page_token: 'pt-keep',
+      backfill_done: true,
+      scope_roots: ['FOLD1'],
+    };
+    const cases: { name: string; picked: FolderNode[] }[] = [
+      { name: 'unchanged', picked: [{ id: 'FOLD1', name: 'Projects', hasChildren: true }] },
+      { name: 'widened to the catch-all', picked: [{ id: 'root', name: 'My Drive', hasChildren: true }] },
+      { name: 'swapped to a sibling', picked: [{ id: 'FOLD2', name: 'Specs', hasChildren: true }] },
+    ];
+
+    for (const c of cases) {
+      const { fetchFn } = driveFetch(world);
+      const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+      const { session } = makeSession({
+        config: { folderRoots: [{ id: 'FOLD1', name: 'Projects' }] },
+        cursor: prior,
+      });
+      const { channel } = makeFolderChannel({ picked: c.picked });
+
+      const update = await source.manageFolders!(session, channel);
+
+      if (update.archiveNullScoped) {
+        // Archiving NULL-scoped rows is only safe when the SAME update
+        // re-walks: contentHash excludes scope and this connector hashSkips,
+        // so nothing else would ever re-emit them. The re-walk un-archives
+        // them through hashSkip's archived-row exception (source.ts:476),
+        // and the page token is never recaptured mid-backfill.
+        expect(update.cursor!.backfill_done).toBe(false);
+        expect(update.cursor!.page_token).toBe(prior.page_token);
+      } else {
+        expect(update.cursor!.backfill_done).toBe(true);
+      }
+    }
+  });
+
+  it('rejects an empty selection and names an unreadable selected folder', async () => {
+    const { fetchFn } = driveFetch({
+      rootId: 'MYDRIVE',
+      gets: { GONE: jsonRes(404, { error: { message: 'File not found: GONE.' } }) },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({ config: { folderRoots: [{ id: 'FOLD1', name: 'P' }] } });
+
+    const empty = makeFolderChannel({ picked: [] });
+    await expect(source.manageFolders!(session, empty.channel)).rejects.toThrow(
+      /no folders selected/,
+    );
+
+    const gone = makeFolderChannel({
+      picked: [{ id: 'GONE', name: 'Deleted plans', hasChildren: true }],
+    });
+    await expect(source.manageFolders!(session, gone.channel)).rejects.toThrow(
+      /folder "Deleted plans" is no longer readable/,
+    );
+  });
+});
+
+describe('invariant 15 — a newly added root never overrides file-indexability policy', () => {
+  it('walks the added root under the forced re-establish and STILL ignores media there', async () => {
+    // The hand-off is the risk, not the policy: manageFolders widens scope,
+    // core persists config+cursor, and the very next pull() walks a folder
+    // this account has never seen. Strict indexing must stay exactly where
+    // it was — chooseRoute runs before any byte fetch, the mp3 produces no
+    // item, and the aggregate policy log still names reasons only.
+    const { fetchFn, calls } = driveFetch({
+      rootId: 'MYDRIVE',
+      gets: {
+        FA: folder('FA', 'Alpha', { parents: ['MYDRIVE'] }),
+        FB: folder('FB', 'Beta', { parents: ['MYDRIVE'] }),
+        MYDRIVE: folder('MYDRIVE', 'My Drive', { parents: [] }),
+      },
+      lists: {
+        FA: [],
+        FB: [
+          binaryFile('mp3-1', 'song.mp3', 'audio/mpeg'),
+          gdoc('b1', 'B doc', { parents: ['FB'] }),
+        ],
+      },
+      exportsMd: { b1: '# B' },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({
+      config: { folderRoots: [{ id: 'FA', name: 'Alpha' }] },
+      cursor: { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'] },
+    });
+    const { channel } = makeFolderChannel({
+      picked: [
+        { id: 'FA', name: 'Alpha', hasChildren: true },
+        { id: 'FB', name: 'Beta', hasChildren: true },
+      ],
+    });
+
+    const update = await source.manageFolders!(session, channel);
+    expect(update.cursor).toEqual({
+      page_token: 'pt-1',
+      backfill_done: false,
+      scope_roots: ['FA', 'FB'],
+    });
+
+    // Replay what core would have persisted, as the next pull's input.
+    const { session: next, logs } = makeSession({ config: update.config });
+    const batches = (await collect(source.pull(next, update.cursor))) as B[];
+
+    // FB IS walked — that is the point of the forced re-establish…
+    expect(batches.flatMap((b) => b.items).map((i) => i.file.id)).toEqual(['b1']);
+    // …and the mp3 under it is still policy-ignored, with zero byte fetch.
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+    const summary = logs.find((l) => /ignored \d+ file\(s\) by policy/.test(l.msg));
+    expect(summary!.msg).toMatch(/cloud-media=1/);
+    expect(logs.some((l) => l.msg.includes('song.mp3'))).toBe(false);
+    // The preserved page_token means no fresh startPageToken capture.
+    expect(calls.some((u) => u.includes('startPageToken'))).toBe(false);
+  });
+});
+
+describe('reauthenticate', () => {
+  it('verifies the returned identity (trimmed, case-insensitive) and never opens the picker', async () => {
+    const { fetchFn, calls } = driveFetch({
+      about: { emailAddress: '  ED@Example.com ', displayName: 'Ed' },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { auth, statuses, getScopes, getPickerSpec } = makeAuth();
+
+    await expect(
+      source.reauthenticate!(fakeAccount({ identifier: 'ed@example.com' }), auth),
+    ).resolves.toBeUndefined();
+
+    expect(getScopes()).toEqual(DRIVE_SCOPES);
+    expect(statuses).toEqual(['Waiting for Google sign-in…', 'Verifying the Google account…']);
+    // Reconnect never changes scope: no picker, and only the about call.
+    expect(getPickerSpec()).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain('/drive/v3/about');
+  });
+
+  it('rejects a different identity and names both, with no token in the message', async () => {
+    const { fetchFn } = driveFetch({ about: { emailAddress: 'someone@else.com' } });
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { auth } = makeAuth();
+
+    await expect(
+      source.reauthenticate!(fakeAccount({ identifier: 'ed@example.com' }), auth),
+    ).rejects.toThrow(
+      /signed in as someone@else\.com, but this account is ed@example\.com/,
+    );
+  });
+
+  it('throws when oauth returns no accessToken, before any fetch', async () => {
+    const { fetchFn, calls } = driveFetch({});
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { auth } = makeAuth({ creds: { refreshToken: '1//fake-refresh-test' } });
+
+    await expect(source.reauthenticate!(fakeAccount(), auth)).rejects.toThrow(
+      /no access token/,
+    );
+    expect(calls).toHaveLength(0);
+  });
+});

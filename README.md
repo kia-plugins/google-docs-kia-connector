@@ -43,14 +43,26 @@ You can connect multiple Google accounts side by side.
 The picker writes the account config as
 
 ```json
-{ "roots": [ { "rootFolderId": "<drive folder id>", "rootName": "<name>" } ] }
+{ "folderRoots": [ { "id": "<drive folder id>", "name": "<name>" } ] }
 ```
 
-with one entry per selected folder (`"root"` is Drive's alias for My Drive).
-An account with no root config at all means all of My Drive. Duplicate root
-ids are ignored (first entry wins). If one tracked root lies inside another,
-the overlapping subtree is indexed once — under whichever root reaches it
-first.
+with one entry per selected folder (`"root"` is Drive's alias for My Drive,
+and is the catch-all: selecting it collapses any of its subfolders out of the
+set, and de-selecting one of its subfolders removes no documents at all). An
+account with no root config at all means all of My Drive. Duplicate root ids
+are ignored (first entry wins). If one tracked root lies inside another, the
+overlapping subtree is indexed once — under whichever root reaches it first.
+
+For one release train core also mirrors the set into the pre-2.2.0
+`{ "roots": [ { "rootFolderId": …, "rootName": … } ] }` shape so an
+un-updated 2.1.6 keeps working. This connector reads that mirror only when
+`folderRoots` is absent, and never writes or removes it.
+
+Every emitted document carries `scopeRootId` — the config id of the root
+whose subtree contains it, the `"root"` alias included — and the cursor
+carries `scope_roots`, the sorted root ids that produced it. A set change
+(order-independent) forces one backfill that keeps the existing
+`page_token`.
 
 ## What gets indexed
 
