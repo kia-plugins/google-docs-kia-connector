@@ -884,6 +884,86 @@ export function makeScopeResolver(client: DriveClient): ScopeResolver {
 }
 
 /**
+ * C-50 — the ANCESTOR ids of the account's current roots, for
+ * `FolderPickerSpec.expand`, so Manage folders opens REVEALED down to each
+ * tracked folder instead of collapsed behind a single "My Drive" row.
+ *
+ * The renderer cannot compute this: a Drive folder id is opaque to it and the
+ * picker's tree paths are synthetic. Only the source can walk `parents`, so
+ * the source ships the answer and the modal matches it by equality.
+ *
+ * Two Drive-specific rules, both the same ones `coveringRoots` lives by:
+ *  - the picker's My Drive tab lists the literal alias `'root'`, but every
+ *    chain terminates at the REAL My Drive id, so the real id is translated
+ *    BACK to `'root'` — otherwise the top row never matches and a folder one
+ *    level down never reveals.
+ *  - a `'root'` selection is itself a root row: nothing to expand.
+ *
+ * Failure policy is the OPPOSITE of `coveringRoots`, deliberately. This runs
+ * before the modal opens and is purely cosmetic, so nothing here throws: an
+ * unreadable root (the usual reason to open Manage folders is that one
+ * vanished) or a dead token simply reveals less, and the picker's own
+ * `roots`/`children` callbacks surface the real error as an inline retry. A
+ * reveal must never be able to keep the user out of the editor.
+ *
+ * Cost: N roots x chain depth shallow GETs through a PRIVATE index. It shares
+ * the caller's resolver only for `myDriveId()` — a real folder id that never
+ * changes for an account, so memoizing it across open and save is free — and
+ * deliberately does NOT write folder parents into that resolver's cache:
+ * `coveringRoots` and `classifyRemovedRoots` decide what gets ARCHIVED, and
+ * they must see Drive as it is at save, not as it was when the user opened
+ * the modal several minutes earlier.
+ */
+export async function expandIdsFor(
+  selected: readonly { id: string; name: string }[],
+  client: DriveClient,
+  resolver: ScopeResolver = makeScopeResolver(client),
+): Promise<string[]> {
+  const index: FolderIndex = new Map();
+  const out = new Set<string>();
+  let myDrive: string | null = null;
+  const realMyDrive = async (): Promise<string | null> => {
+    if (myDrive === null) {
+      try {
+        myDrive = await resolver.myDriveId();
+      } catch {
+        return null;
+      }
+    }
+    return myDrive;
+  };
+
+  for (const node of selected) {
+    if (node.id === 'root') continue;
+    let info: { name: string; parents: string[] };
+    try {
+      info = await folderInfo(node.id, index, client);
+    } catch {
+      continue;
+    }
+    let current = info.parents[0];
+    const visited = new Set<string>([node.id]);
+    for (let hops = 0; hops < MAX_ANCESTOR_HOPS && current; hops++) {
+      if (visited.has(current)) break; // cycle
+      visited.add(current);
+      if (current === (await realMyDrive())) {
+        out.add('root');
+        break;
+      }
+      out.add(current);
+      let ancestor: { name: string; parents: string[] };
+      try {
+        ancestor = await folderInfo(current, index, client);
+      } catch {
+        break;
+      }
+      current = ancestor.parents[0];
+    }
+  }
+  return [...out];
+}
+
+/**
  * Collapse a picked set to a COVERING set: drop any node whose first-parent
  * chain reaches another picked node. Two Drive-specific rules:
  *
@@ -1348,6 +1428,19 @@ export function createGoogleDocsSource(
       const client = clientFor(session);
       const current = rootsConfig(session);
       channel.status('Loading your Drive folders…');
+      // ONE resolver for this whole manage flow. It carries the memoized
+      // `'root'` → real-My-Drive-id lookup across the reveal and the save, so
+      // the alias still costs exactly one `files/root` GET; the reveal keeps
+      // its folder-parent lookups out of this cache on purpose (see
+      // `expandIdsFor`).
+      const resolver = makeScopeResolver(client);
+      // `hasChildren` is always true here for the same reason
+      // `listFolderNodes` sets it: probing would cost one API call per row.
+      const selectedNodes = current.map((r) => ({
+        id: r.rootFolderId,
+        name: r.rootName,
+        hasChildren: true,
+      }));
       const picked = await channel.pickFolders({
         modes: [
           { key: 'my-drive', label: 'My Drive' },
@@ -1355,14 +1448,12 @@ export function createGoogleDocsSource(
         ],
         multiSelect: true,
         purpose: 'manage',
-        // Pre-checked AND removable. `hasChildren` is always true here for
-        // the same reason `listFolderNodes` sets it: probing would cost one
-        // API call per row.
-        selected: current.map((r) => ({
-          id: r.rootFolderId,
-          name: r.rootName,
-          hasChildren: true,
-        })),
+        // Pre-checked AND removable.
+        selected: selectedNodes,
+        // C-50: open revealed down to the tracked folders. Computed before
+        // the modal renders, so `status` above is what the user sees while
+        // the chains are walked.
+        expand: await expandIdsFor(selectedNodes, client, resolver),
         roots: async (mode) =>
           mode === 'my-drive'
             ? [{ id: 'root', name: 'My Drive', hasChildren: true }]
@@ -1373,7 +1464,6 @@ export function createGoogleDocsSource(
       if (picked.length === 0) throw new Error('google-docs: no folders selected');
 
       channel.status('Checking the selection…');
-      const resolver = makeScopeResolver(client);
       const kept = await coveringRoots(picked, client, resolver);
       const folderRoots = kept.map((n) => ({ id: n.id, name: n.name }));
       const scopeRoots = [...new Set(folderRoots.map((r) => r.id))].sort();

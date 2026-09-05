@@ -226,6 +226,99 @@ describe('manageFolders', () => {
     ]);
   });
 
+  /**
+   * C-50 — the picker must OPEN revealed down to the tracked folders. The
+   * renderer cannot derive this (Drive ids are opaque to it), so the source
+   * ships the ancestor chain and the modal matches it by equality.
+   */
+  describe('spec.expand (C-50 reveal)', () => {
+    it("translates the REAL My Drive id back to the picker's 'root' alias", async () => {
+      // FOLD1's chain terminates at MYDRIVE, but the My Drive tab lists the
+      // literal alias 'root'. Emitting the real id would match no row and the
+      // folder would stay hidden — the whole bug this fixes.
+      const { fetchFn } = driveFetch(world);
+      const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+      const { session } = makeSession({
+        config: { folderRoots: [{ id: 'FOLD1', name: 'Projects' }] },
+      });
+      const { channel, getPickerSpec } = makeFolderChannel({
+        picked: [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+      });
+
+      await source.manageFolders!(session, channel);
+
+      expect(getPickerSpec()!.expand).toEqual(['root']);
+    });
+
+    it('walks a nested root to its full chain and never lists the root itself', async () => {
+      const { fetchFn } = driveFetch({
+        rootId: 'MYDRIVE',
+        gets: {
+          DEEP: folder('DEEP', 'Deep', { parents: ['MID'] }),
+          MID: folder('MID', 'Mid', { parents: ['TOP'] }),
+          TOP: folder('TOP', 'Top', { parents: ['MYDRIVE'] }),
+          MYDRIVE: folder('MYDRIVE', 'My Drive', { parents: [] }),
+        },
+      });
+      const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+      const { session } = makeSession({
+        config: { folderRoots: [{ id: 'DEEP', name: 'Deep' }] },
+      });
+      const { channel, getPickerSpec } = makeFolderChannel({
+        picked: [{ id: 'DEEP', name: 'Deep', hasChildren: true }],
+      });
+
+      await source.manageFolders!(session, channel);
+
+      // Nearest-first, ending at the alias. DEEP is absent: expanding a
+      // selected row would push its children between it and its chip.
+      expect(getPickerSpec()!.expand).toEqual(['MID', 'TOP', 'root']);
+    });
+
+    it("a 'root' selection expands nothing — the catch-all IS a root row", async () => {
+      const { fetchFn } = driveFetch(world);
+      const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+      const { session } = makeSession({
+        config: { folderRoots: [{ id: 'root', name: 'My Drive' }] },
+      });
+      const { channel, getPickerSpec } = makeFolderChannel({
+        picked: [{ id: 'root', name: 'My Drive', hasChildren: true }],
+      });
+
+      await source.manageFolders!(session, channel);
+
+      expect(getPickerSpec()!.expand).toEqual([]);
+    });
+
+    it('an unreadable root reveals less instead of keeping the user out of the editor', async () => {
+      // Removing a vanished root is the main reason to open Manage folders,
+      // so a reveal failure must never throw past the picker. GONE is not in
+      // `gets`; the surviving root still reveals.
+      const { fetchFn } = driveFetch(world);
+      const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+      const { session } = makeSession({
+        config: {
+          folderRoots: [
+            { id: 'GONE', name: 'Deleted plans' },
+            { id: 'FOLD1', name: 'Projects' },
+          ],
+        },
+      });
+      const { channel, getPickerSpec } = makeFolderChannel({
+        picked: [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+      });
+
+      // The SAVE still refuses (classifyRemovedRoots cannot prove coverage
+      // for a folder it cannot read) — that guard is unchanged and correct.
+      await expect(source.manageFolders!(session, channel)).rejects.toThrow(
+        /could not determine whether folder "Deleted plans"/,
+      );
+      // But the picker OPENED, and opened revealed: the reveal swallowed the
+      // unreadable root and still walked the readable one.
+      expect(getPickerSpec()!.expand).toEqual(['root']);
+    });
+  });
+
   it("retaining the 'root' catch-all archives NOTHING — the Save-path half of R6's 314-of-316 fix", async () => {
     // DECISIONS R6 + R8's Drive rule, for the case where it holds: FOLD1 is
     // really a My Drive folder, so the walk finds MYDRIVE and 'root' really
