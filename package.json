@@ -1,6 +1,6 @@
 {
   "name": "google-docs-kia-connector",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "private": true,
   "description": "Google Docs / Drive connector for KIAgent (new extension platform)",
   "files": [
@@ -15,7 +15,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@kiagent/connector-sdk": "https://github.com/edjafarov/kiagent-core/releases/download/sdk-v1.1.0/kiagent-connector-sdk-1.1.0.tgz",
+    "@kiagent/connector-sdk": "https://github.com/edjafarov/kiagent-core/releases/download/sdk-v1.2.0/kiagent-connector-sdk-1.2.0.tgz",
     "@types/jest": "^29.5.0",
     "@types/node": "^20.11.0",
     "esbuild": "^0.24.0",

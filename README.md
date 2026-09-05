@@ -43,14 +43,40 @@ You can connect multiple Google accounts side by side.
 The picker writes the account config as
 
 ```json
-{ "roots": [ { "rootFolderId": "<drive folder id>", "rootName": "<name>" } ] }
+{ "folderRoots": [ { "id": "<drive folder id>", "name": "<name>" } ] }
 ```
 
-with one entry per selected folder (`"root"` is Drive's alias for My Drive).
-An account with no root config at all means all of My Drive. Duplicate root
-ids are ignored (first entry wins). If one tracked root lies inside another,
-the overlapping subtree is indexed once — under whichever root reaches it
-first.
+with one entry per selected folder (`"root"` is Drive's alias for My Drive,
+and is the catch-all: selecting it collapses any of its subfolders out of the
+set). An account with no root config at all means all of My Drive. Duplicate root ids
+are ignored (first entry wins). If one tracked root lies inside another, the
+overlapping subtree is indexed once — under whichever root reaches it first.
+
+For one release train core also mirrors the set into the pre-2.2.0
+`{ "roots": [ { "rootFolderId": …, "rootName": … } ] }` shape so an
+un-updated 2.1.6 keeps working. This connector reads that mirror only when
+`folderRoots` is absent, and never writes or removes it.
+
+Every emitted document carries `scopeRootId` — the config id of the root
+whose subtree contains it, the `"root"` alias included — and the cursor
+carries `scope_roots`, the sorted root ids that produced it. A set change
+(order-independent) forces one backfill that keeps the existing
+`page_token`.
+
+De-selecting a folder does **not** decide anything by shape: each removed
+root gets a real ancestor walk against the roots you kept.
+
+- **Still covered by a root you kept** (de-selecting a subfolder while My
+  Drive, or any ancestor of it, stays selected) — nothing is removed and
+  nothing is re-downloaded. Those documents are simply re-attributed to the
+  covering root.
+- **No longer covered** — a shared-with-me or shared-drive folder, which
+  lives outside My Drive entirely, or a folder whose every ancestor you also
+  de-selected — its documents are removed from the local index. Keeping My
+  Drive selected does not save them: they were never under it.
+- **Undeterminable** — if Drive cannot say where a removed folder sits
+  (a server or network failure, as opposed to a folder that is simply gone),
+  the save is refused and named rather than guessed. Try again.
 
 ## What gets indexed
 

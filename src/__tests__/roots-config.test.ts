@@ -65,4 +65,57 @@ describe('rootsConfig', () => {
       { rootFolderId: 'FB', rootName: 'Other' },
     ]);
   });
+
+  it('reads the canonical folderRoots shape', () => {
+    expect(
+      roots({
+        folderRoots: [
+          { id: 'FA', name: 'Alpha' },
+          { id: 'SH1', name: 'Shared specs' },
+        ],
+      }),
+    ).toEqual([
+      { rootFolderId: 'FA', rootName: 'Alpha' },
+      { rootFolderId: 'SH1', rootName: 'Shared specs' },
+    ]);
+  });
+
+  it('prefers folderRoots over the legacy roots mirror when both are present', () => {
+    // Core writes the mirror alongside the canonical set for one release
+    // train (DECISIONS R1 + A-2) so a still-installed 2.1.6 keeps working.
+    // This connector must never read the mirror while the canonical set is
+    // usable — and never writes or strips it either.
+    expect(
+      roots({
+        folderRoots: [{ id: 'FA', name: 'Alpha' }],
+        roots: [{ rootFolderId: 'STALE', rootName: 'Stale' }],
+      }),
+    ).toEqual([{ rootFolderId: 'FA', rootName: 'Alpha' }]);
+  });
+
+  it('falls back to the legacy roots mirror when folderRoots is absent or unusable', () => {
+    const legacy = { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] };
+    expect(roots(legacy)).toEqual([{ rootFolderId: 'FA', rootName: 'Alpha' }]);
+    expect(roots({ folderRoots: [], ...legacy })).toEqual([
+      { rootFolderId: 'FA', rootName: 'Alpha' },
+    ]);
+    expect(roots({ folderRoots: [{ id: 7 }], ...legacy })).toEqual([
+      { rootFolderId: 'FA', rootName: 'Alpha' },
+    ]);
+  });
+
+  it('folderRoots keeps the per-entry name fallback and the first-wins dedupe', () => {
+    expect(
+      roots({
+        folderRoots: [
+          { id: 'root' },
+          { id: 'FA', name: '' },
+          { id: 'FA', name: 'Second' },
+        ],
+      }),
+    ).toEqual([
+      { rootFolderId: 'root', rootName: 'My Drive' },
+      { rootFolderId: 'FA', rootName: 'FA' },
+    ]);
+  });
 });

@@ -182,6 +182,7 @@ describe('toDocument', () => {
       type: 'gdocs.doc',
       title: 'Doc A',
       markdown: '# Doc A',
+      scopeRootId: 'root',
       url: 'https://docs.google.com/document/d/docA/edit',
       metadata: {
         drive_file_id: 'docA',
@@ -256,6 +257,46 @@ describe('toDocument', () => {
     expect(doc.metadata.mime).toBe('application/vnd.google-apps.spreadsheet');
     expect(doc.metadata.filename).toBe('Budget');
     expect('sizeBytes' in doc.metadata).toBe(false);
+  });
+
+  it('stamps scopeRootId with the CONFIG id, alias included, matching metadata.root_folder_id', () => {
+    // The three strings core joins on must be identical: folderRoots[].id,
+    // metadata.root_folder_id (what the v3 migration backfills from), and
+    // scope_root_id. All three are RootConfig.rootFolderId verbatim — the
+    // 'root' alias is NEVER resolved to the real My Drive id here.
+    const item: DriveItem = {
+      file: gdoc('docA', 'Doc A'),
+      docType: 'gdocs.doc',
+      markdown: '# Doc A',
+      extractionStatus: 'ok',
+      displayPath: 'My Drive',
+      rootFolderId: 'root',
+    };
+    const doc = source.toDocument(item) as DocumentInput;
+    expect(doc.scopeRootId).toBe('root');
+    expect(doc.metadata.root_folder_id).toBe('root');
+  });
+
+  it('stamps scopeRootId on binary and metadata-only rows too', () => {
+    const binary = source.toDocument({
+      file: pdf('pdfB', 'b.pdf'),
+      docType: 'file',
+      markdown: null,
+      bytes: new Uint8Array([1]),
+      extractionStatus: 'ok',
+      displayPath: 'Specs',
+      rootFolderId: 'FOLD2',
+    }) as DocumentInput;
+    const metaOnly = source.toDocument({
+      file: gdoc('docZ', 'Doc Z'),
+      docType: 'gdocs.doc',
+      markdown: '',
+      extractionStatus: 'failed',
+      displayPath: 'Specs',
+      rootFolderId: 'FOLD2',
+    }) as DocumentInput;
+    expect(binary.scopeRootId).toBe('FOLD2');
+    expect(metaOnly.scopeRootId).toBe('FOLD2');
   });
 });
 
