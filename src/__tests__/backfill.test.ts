@@ -13,12 +13,14 @@ import {
 import { GoogleDocsAuthError } from '../client';
 import type { Batch } from '@kiagent/connector-sdk';
 import {
+  binaryFile,
   collect,
   driveFetch,
   fakeDoc,
   fakeQuery,
   folder,
   gdoc,
+  googleNative,
   instantClock,
   jsonRes,
   makeHost,
@@ -145,46 +147,62 @@ describe('backfill', () => {
     expect(logs.filter((l) => l.level === 'warn')).toHaveLength(2);
   });
 
-  it('routes non-Doc Google-native types to metadata-only unsupported rows (no fetch)', async () => {
-    const sheet = {
-      id: 'sheet1',
-      name: 'Budget',
-      mimeType: 'application/vnd.google-apps.spreadsheet',
-      parents: ['MYDRIVE'],
-      modifiedTime: '2026-05-01T00:00:00Z',
-    };
+  it('ignores non-Doc Google-native types before any I/O (zero items, no fetch)', async () => {
+    const sheet = googleNative('sheet1', 'Budget', 'application/vnd.google-apps.spreadsheet');
     const { source, calls } = makeSource({ lists: { root: [sheet] } });
     const { session } = makeSession();
 
     const batches = (await collect(source.pull(session, null))) as B[];
 
-    expect(batches[0].items[0]).toMatchObject({
-      docType: 'file',
-      markdown: '',
-      extractionStatus: 'unsupported',
-    });
+    expect(batches.flatMap((b) => b.items)).toEqual([]);
     expect(calls.filter((u) => u.includes('sheet1'))).toEqual([]);
   });
 
-  it('skips bytes for a too-large binary (no alt=media call) and marks it too-large', async () => {
+  it('ignores a too-large binary before download (no alt=media call, zero items)', async () => {
     const big = pdf('big1', 'huge.pdf', { size: String(26 * 1024 * 1024) });
     const { source, calls } = makeSource({ lists: { root: [big] } });
     const { session } = makeSession();
 
     const batches = (await collect(source.pull(session, null))) as B[];
 
-    expect(batches[0].items[0]).toMatchObject({
-      docType: 'file',
-      markdown: '',
-      extractionStatus: 'too-large',
-    });
+    expect(batches.flatMap((b) => b.items)).toEqual([]);
     expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+  });
+
+  it('ignores unsupported/media/archive/oversized files before any content I/O (zero items, zero export/media calls)', async () => {
+    const files = [
+      binaryFile('mp3-1', 'song.mp3', 'audio/mpeg'),
+      binaryFile('mp4-1', 'video.mp4', 'video/mp4'),
+      binaryFile('zip-1', 'archive.zip', 'application/zip'),
+      binaryFile('zip-big', 'big.zip', 'application/zip', { size: String(26 * 1024 * 1024) }),
+      binaryFile('exe-1', 'setup.exe', 'application/x-msdownload'),
+      binaryFile('bin-1', 'blob.bin', 'application/octet-stream'),
+      googleNative('sheet-1', 'Budget', 'application/vnd.google-apps.spreadsheet'),
+      googleNative('slide-1', 'Deck', 'application/vnd.google-apps.presentation'),
+    ];
+    const { source, calls } = makeSource({ lists: { root: files } });
+    const { session, logs } = makeSession();
+
+    const batches = (await collect(source.pull(session, null))) as B[];
+
+    expect(batches.flatMap((b) => b.items)).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media') || u.includes('/export'))).toBe(false);
+    // One aggregate summary, reason counts only — never a filename or file id.
+    const summary = logs.find((l) => /ignored \d+ file\(s\) by policy/.test(l.msg));
+    expect(summary).toBeDefined();
+    expect(summary!.msg).toMatch(/cloud-media=2, archive=2, unsupported=4/);
+    for (const f of files) {
+      expect(logs.some((l) => l.msg.includes(f.name))).toBe(false);
+    }
   });
 
   it('hash-skip: unchanged head_revision_id / md5_checksum → no export, no download, no item', async () => {
     const query = fakeQuery([
-      fakeDoc('docA', 'gdocs.doc', { head_revision_id: 'rev-docA-1' }),
-      fakeDoc('pdfB', 'file', { md5_checksum: 'md5-pdfB-1' }),
+      fakeDoc('docA', 'gdocs.doc', {
+        head_revision_id: 'rev-docA-1',
+        extraction_status: 'ok',
+      }),
+      fakeDoc('pdfB', 'file', { md5_checksum: 'md5-pdfB-1', extraction_status: 'ok' }),
     ]);
     const { source, calls } = makeSource(
       { lists: { root: [gdoc('docA', 'Doc A'), pdf('pdfB', 'b.pdf')] } },
@@ -246,7 +264,32 @@ describe('backfill', () => {
     });
   });
 
-  it('caps an unknown-size binary AFTER download (post-hoc too-large row, no bytes emitted)', async () => {
+  it('hash-skip does NOT apply to a legacy unsupported/too-large row whose route has since flipped positive', async () => {
+    // A stale row from before this policy (or from the extension-rescue
+    // widening: octet-stream + a recognized extension now routes as a
+    // convertible binary where the old mime-only check called it
+    // 'unsupported'). Its md5 happens to match the unchanged file, but
+    // pinning it would leave a real, indexable file stuck as metadata-only
+    // forever — it must be re-fetched instead.
+    const query = fakeQuery([
+      fakeDoc('x', 'file', { md5_checksum: 'md5-x-1', extraction_status: 'unsupported' }),
+    ]);
+    const { source, calls } = makeSource(
+      {
+        lists: { root: [binaryFile('x', 'scan.pdf', 'application/octet-stream')] },
+        media: { x: new Uint8Array([1, 2, 3]) },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, null))) as B[];
+
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(true);
+    expect(batches.flatMap(ids)).toEqual(['x']);
+  });
+
+  it('ignores an unknown-size binary AFTER download (post-hoc too-large, zero items)', async () => {
     const { source } = makeSource({
       lists: { root: [pdf('nosize1', 'n.pdf', { size: undefined })] },
       media: { nosize1: new Uint8Array(MAX_BINARY_BYTES + 1) },
@@ -255,12 +298,9 @@ describe('backfill', () => {
 
     const batches = (await collect(source.pull(session, null))) as B[];
 
-    expect(batches[0].items[0]).toMatchObject({
-      docType: 'file',
-      markdown: '',
-      extractionStatus: 'too-large',
-    });
-    expect(batches[0].items[0].bytes).toBeUndefined();
+    // The download DID happen (size was unknown pre-fetch) but the bytes
+    // are discarded — no item, no DocumentInput.
+    expect(batches.flatMap((b) => b.items)).toEqual([]);
   });
 
   it('one unreadable file is warn-skipped and the walk continues', async () => {

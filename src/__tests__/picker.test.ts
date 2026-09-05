@@ -8,6 +8,7 @@ import { countFilesUnder, listChildFolders, listSharedRoots } from '../source';
 import { DriveClient } from '../client';
 import type { NetFetch } from '../client';
 import {
+  binaryFile,
   driveFetch,
   folder,
   gdoc,
@@ -99,9 +100,17 @@ describe('listChildFolders', () => {
 });
 
 describe('countFilesUnder', () => {
-  it('counts pure files in a flat folder (capped: false)', async () => {
+  it('counts eligible files in a flat folder, excluding policy-ignored ones (capped: false)', async () => {
     const { fetchFn, calls } = driveFetch({
-      lists: { F1: [pdf('p1', 'a.pdf'), pdf('p2', 'b.pdf'), gdoc('d1', 'Doc')] },
+      lists: {
+        F1: [
+          pdf('p1', 'a.pdf'),
+          pdf('p2', 'b.pdf'),
+          gdoc('d1', 'Doc'),
+          binaryFile('mp3-1', 'song.mp3', 'audio/mpeg'),
+          binaryFile('zip-1', 'archive.zip', 'application/zip'),
+        ],
+      },
     });
 
     const res = await countFilesUnder(makeClient(fetchFn), 'F1');
@@ -109,7 +118,9 @@ describe('countFilesUnder', () => {
     expect(res).toEqual({ count: 3, capped: false });
     const u = new URL(calls[0]);
     expect(u.searchParams.get('q')).toBe("'F1' in parents and trashed = false");
-    expect(u.searchParams.get('fields')).toBe('files(id,mimeType),nextPageToken');
+    expect(u.searchParams.get('fields')).toBe(
+      'files(id,mimeType,name,size,shortcutDetails(targetMimeType)),nextPageToken',
+    );
     expect(u.searchParams.get('pageSize')).toBe('1000');
   });
 
@@ -127,10 +138,39 @@ describe('countFilesUnder', () => {
     expect(res).toEqual({ count: 4, capped: false });
   });
 
-  it('counts shortcuts as files without resolving targets (estimate)', async () => {
+  it('counts a shortcut whose target is eligible, without resolving the target (estimate)', async () => {
     const { fetchFn, calls } = driveFetch({
       lists: {
         F1: [shortcut('sc1', 'Link', 'TD1', 'application/pdf'), gdoc('d1', 'Doc')],
+      },
+    });
+
+    const res = await countFilesUnder(makeClient(fetchFn), 'F1');
+
+    expect(res).toEqual({ count: 2, capped: false });
+    expect(calls.some((u) => u.includes('TD1'))).toBe(false);
+  });
+
+  it('does not count a shortcut whose target is ineligible (e.g. audio) — target mime decides, no fetch', async () => {
+    const { fetchFn, calls } = driveFetch({
+      lists: {
+        F1: [shortcut('sc1', 'Song link', 'TD1', 'audio/mpeg'), gdoc('d1', 'Doc')],
+      },
+    });
+
+    const res = await countFilesUnder(makeClient(fetchFn), 'F1');
+
+    expect(res).toEqual({ count: 1, capped: false });
+    expect(calls.some((u) => u.includes('TD1'))).toBe(false);
+  });
+
+  it('counts (over-admits) a shortcut whose target mime is generic/ambiguous rather than undercounting — the real name/extension is unknown from a listing, so a rescue that ingest would apply cannot be ruled out', async () => {
+    const { fetchFn, calls } = driveFetch({
+      lists: {
+        F1: [
+          shortcut('sc1', 'Ambiguous link', 'TD1', 'application/octet-stream'),
+          gdoc('d1', 'Doc'),
+        ],
       },
     });
 

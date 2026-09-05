@@ -56,18 +56,22 @@ first.
 
 - **Native Google Docs** — exported as Markdown (with a plain-text fallback);
   deep links back to the original document.
-- **Binary files the platform can extract** — PDF, Word (.docx), Excel
-  (.xlsx), CSV/HTML/plain-text and other `text/*` files are downloaded (up to
-  25 MiB) and converted locally by the engine; images (PNG/JPEG/…) go through
-  the local OCR / vision pipeline.
-- **Everything else** (Sheets/Slides/Forms native types, unknown binaries,
-  oversized files) — indexed as metadata-only entries: title, folder path,
-  link, timestamps.
+- **Supported binary files** — PDF, Word (.docx), Excel (.xlsx), CSV/HTML/
+  plain-text and other `text/*` files are downloaded (up to 25 MiB) and
+  converted locally by the engine; images (PNG/JPEG/…) are downloaded (up to
+  20 MiB) and go through the local OCR / vision pipeline.
+- **Everything else is ignored before any download** — audio and video (any
+  size), archives (.zip, .7z, .rar, and the rest, any size), unknown/
+  unsupported binaries, files over the size caps above, and unsupported
+  Google-native types (Sheets, Slides, Forms, …). None of these produce a
+  document, a download, or any local row — a shortcut to one of them is
+  ignored too, once its target type is resolved.
 - **Folder paths** — every document records a human-readable `display_path`
   from the tracked root it was found under (and that root's id as
   `root_folder_id`).
-- Files deleted, trashed, or moved out of every indexed folder are archived
-  from the local index. Shortcuts are resolved to their targets.
+- Files deleted, trashed, moved out of every indexed folder, or newly
+  ignored by this policy are archived from the local index. Shortcuts are
+  resolved to their targets.
 
 Unchanged files are skipped by content hash (Drive's `headRevisionId` /
 `md5Checksum`), so re-syncs are cheap.
@@ -84,10 +88,10 @@ Unchanged files are skipped by content hash (Drive's `headRevisionId` /
 
 - **Shared Drives (Team Drives) are not indexed** — My Drive and
   shared-with-me folders only.
-- Sheets and Slides are indexed as metadata only — content export is
-  deferred.
+- Sheets and Slides are not indexed at all — content export is deferred, and
+  they carry no bytes worth a metadata-only row either.
 - Renaming or moving a folder does not re-render the recorded `display_path`
   of documents already indexed beneath it; paths refresh when the documents
   themselves next change (or after a full re-walk).
-- Binary downloads are capped at 25 MiB; larger files are indexed as
-  metadata only.
+- Binary/PDF/Office downloads are capped at 25 MiB and images at 20 MiB;
+  larger files are ignored, not indexed as metadata only.

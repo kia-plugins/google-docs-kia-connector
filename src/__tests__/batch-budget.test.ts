@@ -153,22 +153,22 @@ describe('batch byte budget', () => {
     expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
   });
 
-  it('delta: the item limit flushes metadata-only items and deletions too; each deletion lands in exactly one chunk', async () => {
-    const exe = { mimeType: 'application/x-msdownload' };
+  it('delta: the item limit flushes ordinary items and deletions together; each deletion lands in exactly one chunk', async () => {
     const { source } = makeSource(
       {
         changes: {
           'pt-1': {
             changes: [
               { fileId: 'gone1', removed: true },
-              { fileId: 'x1', file: pdf('x1', 'x1.exe', exe) },
-              { fileId: 'x2', file: pdf('x2', 'x2.exe', exe) },
-              { fileId: 'x3', file: pdf('x3', 'x3.exe', exe) },
+              { fileId: 'x1', file: pdf('x1', 'x1.pdf') },
+              { fileId: 'x2', file: pdf('x2', 'x2.pdf') },
+              { fileId: 'x3', file: pdf('x3', 'x3.pdf') },
               { fileId: 'gone2', removed: true },
             ],
             newStartPageToken: 'nspt-2',
           },
         },
+        media: { x1: bytes(3), x2: bytes(3), x3: bytes(3) },
       },
       { batchItemLimit: 2 },
       fakeQuery([fakeDoc('gone1', 'file', {}), fakeDoc('gone2', 'file', {})]),
@@ -184,6 +184,34 @@ describe('batch byte budget', () => {
     ]);
     expect(batches.slice(0, -1).every((b) => b.cursor.page_token === 'pt-1')).toBe(true);
     expect(batches.at(-1)!.cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+  });
+
+  it('delta: a policy-ignored file (no local row) costs the item limit nothing — it never enters the accumulator', async () => {
+    const { source } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'mp3-1', file: pdf('mp3-1', 'song.mp3', { mimeType: 'audio/mpeg' }) },
+              { fileId: 'a', file: pdf('a', 'a.pdf') },
+              { fileId: 'b', file: pdf('b', 'b.pdf') },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        media: { a: bytes(3), b: bytes(3) },
+      },
+      { batchItemLimit: 2 },
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    // mp3-1 is dropped silently (nothing local to delete) without touching
+    // the accumulator — 'a' and 'b', the only real work, still land
+    // together in ONE chunk under the limit of 2, with the usual trailing
+    // empty chunk that advances the token.
+    expect(batches.map(ids)).toEqual([['a', 'b'], []]);
   });
 
   it('backfill: a listing page splits into chunks under the same (stable) cursor, then the live flip', async () => {

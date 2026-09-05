@@ -4,10 +4,16 @@
  * tolerance (the v1-bug-3 regression test), invalid-token recovery, and auth
  * propagation.
  */
-import { createGoogleDocsSource, type DriveCursor, type DriveItem } from '../source';
+import {
+  createGoogleDocsSource,
+  MAX_BINARY_BYTES,
+  type DriveCursor,
+  type DriveItem,
+} from '../source';
 import { GoogleDocsAuthError } from '../client';
 import type { Batch } from '@kiagent/connector-sdk';
 import {
+  binaryFile,
   collect,
   driveFetch,
   fakeDoc,
@@ -19,6 +25,7 @@ import {
   makeHost,
   makeSession,
   pdf,
+  shortcut,
 } from '../testing/harness';
 
 type B = Batch<DriveCursor, DriveItem>;
@@ -96,6 +103,142 @@ describe('delta', () => {
 
     const batches = (await collect(source.pull(session, LIVE))) as B[];
     expect(batches[0].deletions).toEqual([{ externalId: 'tr1', type: 'file' }]);
+  });
+
+  it('a policy-ignored change (MP3) to a pre-existing live file doc: exactly one deletion ref, no item, no download', async () => {
+    const query = fakeQuery([fakeDoc('mp3-1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [{ fileId: 'mp3-1', file: binaryFile('mp3-1', 'song.mp3', 'audio/mpeg') }],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'mp3-1', type: 'file' }]);
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+  });
+
+  it('a policy-ignored change (ZIP) to a pre-existing live file doc: exactly one deletion ref, no item, no download', async () => {
+    const query = fakeQuery([fakeDoc('zip-1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'zip-1', file: binaryFile('zip-1', 'archive.zip', 'application/zip') },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'zip-1', type: 'file' }]);
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+  });
+
+  it('a post-download too-large ignore (unknown pre-download size) still emits a deletion for a pre-existing live row', async () => {
+    // Unknown size is admitted PROVISIONALLY pre-download (chooseRoute has
+    // no size to cap on) — the change is downloaded, and only THEN does the
+    // post-download backstop discover it exceeds the cap. That 'ignored'
+    // BuildResult must be treated the same as a pre-download ignore: a
+    // deletion ref for the pre-existing row, not silence.
+    const query = fakeQuery([fakeDoc('nosize1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'nosize1', file: pdf('nosize1', 'n.pdf', { size: undefined }) },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        media: { nosize1: new Uint8Array(MAX_BINARY_BYTES + 1) },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    // The download DID happen (unknown size was admitted provisionally)...
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(true);
+    // ...but the oversized bytes are discarded: no item, one deletion ref.
+    expect(batches[0].items).toEqual([]);
+    expect(batches[0].deletions).toEqual([{ externalId: 'nosize1', type: 'file' }]);
+  });
+
+  it('a shortcut whose target mime is audio/mpeg is ignored after target resolution: deletion when a local row exists, no download', async () => {
+    const query = fakeQuery([fakeDoc('song-target', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'sc1', file: shortcut('sc1', 'Song link', 'song-target', 'audio/mpeg') },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        gets: { 'song-target': binaryFile('song-target', 'song.mp3', 'audio/mpeg') },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    expect(batches[0].deletions).toEqual([{ externalId: 'song-target', type: 'file' }]);
+    expect(batches[0].items).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+    // Target resolution DID happen (needed to learn the real mime) — the
+    // download that follows a positive route did not.
+    expect(calls.some((u) => u.includes('song-target'))).toBe(true);
+  });
+
+  it('a shortcut whose target is served with a generic mime but a rescuable .pdf name IS indexed (extension rescue, real target name only known after resolution)', async () => {
+    const { source, calls } = makeSource({
+      changes: {
+        'pt-1': {
+          changes: [
+            {
+              fileId: 'sc1',
+              file: shortcut('sc1', 'Scan link', 'scan-target', 'application/octet-stream'),
+            },
+          ],
+          newStartPageToken: 'nspt-2',
+        },
+      },
+      gets: {
+        'scan-target': binaryFile('scan-target', 'scan.pdf', 'application/octet-stream'),
+      },
+      media: { 'scan-target': new Uint8Array([1, 2, 3]) },
+    });
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    // The shortcut's own name ('Scan link') has no extension worth rescuing
+    // on — it is the TARGET's real name ('scan.pdf'), only known after
+    // buildItem resolves the shortcut, that trips decideFileIndexing's
+    // octet-stream + '.pdf' rescue branch.
+    expect(batches.flatMap((b) => b.items.map((i) => i.file.id))).toEqual(['scan-target']);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(true);
   });
 
   it('out-of-scope move → deletion ref for the locally existing doc, nothing downloaded', async () => {

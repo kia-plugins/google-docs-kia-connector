@@ -31,6 +31,7 @@ import type {
   Document,
   DocumentInput,
   ExternalRef,
+  FileIgnoreReason,
   FolderCount,
   FolderNode,
   HostFor,
@@ -38,6 +39,7 @@ import type {
   Session,
   Source,
 } from '@kiagent/connector-sdk';
+import { MAX_CLOUD_BINARY_BYTES, MAX_CLOUD_IMAGE_BYTES } from '@kiagent/connector-sdk';
 import {
   DriveApiError,
   DriveClient,
@@ -52,13 +54,16 @@ import {
   GOOGLE_DOC_MIME,
   GOOGLE_FOLDER_MIME,
   GOOGLE_SHORTCUT_MIME,
-  isConvertibleMime,
+  type DriveRoute,
 } from './export-map';
 
 export const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 export const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
-/** v1 had NO cap (whole file into a Buffer — v1 gap #6); v2 binds one. */
-export const MAX_BINARY_BYTES = 25 * 1024 * 1024;
+/** Binary/PDF/Office cap — delegated to the SDK's canonical cloud-drive
+ *  policy so this connector never drifts from it (v1 had NO cap at all —
+ *  whole file into a Buffer, v1 gap #6). Images have their own, smaller
+ *  cap (`MAX_CLOUD_IMAGE_BYTES`) applied inside `chooseRoute`. */
+export const MAX_BINARY_BYTES = MAX_CLOUD_BINARY_BYTES;
 
 /**
  * Per-batch flush budget. Listing / changes pages are requested at pageSize
@@ -123,6 +128,12 @@ export interface DriveItem {
   displayPath: string;
   rootFolderId: string;
 }
+
+/** buildItem's result: a constructed item to stage, or a policy ignore
+ *  (never both — an ignored file produces zero items, zero downloads). */
+export type BuildResult =
+  | { kind: 'item'; item: DriveItem }
+  | { kind: 'ignored'; reason: FileIgnoreReason; fileId: string };
 
 interface FileListPage {
   files?: DriveFile[];
@@ -207,26 +218,70 @@ export const listChildFolders = (client: DriveClient, id: string): Promise<Folde
   );
 
 interface CountListPage {
-  files?: { id: string; mimeType: string }[];
+  files?: {
+    id: string;
+    name: string;
+    mimeType: string;
+    size?: string;
+    shortcutDetails?: { targetMimeType: string };
+  }[];
   nextPageToken?: string;
 }
 
 function countListUrl(folderId: string, pageToken?: string): string {
   const url = new URL(`${DRIVE_API}/files`);
   url.searchParams.set('q', `'${escapeDriveId(folderId)}' in parents and trashed = false`);
-  url.searchParams.set('fields', 'files(id,mimeType),nextPageToken');
+  url.searchParams.set(
+    'fields',
+    'files(id,mimeType,name,size,shortcutDetails(targetMimeType)),nextPageToken',
+  );
   url.searchParams.set('pageSize', '1000');
   if (pageToken) url.searchParams.set('pageToken', pageToken);
   return url.toString();
 }
 
 /**
+ * Whether an 'ignore' route computed for a SHORTCUT target (filename always
+ * `''`, since a listing never returns the target's real name — see
+ * `chooseRoute` call sites below) can be trusted as a genuine ignore.
+ *
+ * Two reasons are mime-final and always trustworthy regardless of the
+ * (unknown) real filename: 'archive' and 'cloud-media' are decided purely
+ * from `mime`/mime-prefix, never from an extension, when the filename is
+ * `''`. So is ANY ignore verdict for a Google-native target mime
+ * (`application/vnd.google-apps.*`) — `chooseRoute` decides those before
+ * ever consulting the SDK's extension-aware branches, and no extension
+ * could rescue a native format anyway.
+ *
+ * A plain 'unsupported' verdict for a non-Google-native mime is NOT
+ * trustworthy here: the SDK's extension-rescue branches (e.g. a generic
+ * `application/octet-stream` mime paired with a `.pdf` name) could still
+ * admit the file once its real name is known — which is exactly what
+ * `buildItem`'s shortcut-resolution branch sees, since it fetches the
+ * target's full metadata (real name included) before routing. Reconcile
+ * and countFilesUnder never see that name, so they must NOT omit/undercount
+ * on this ambiguous case: over-admitting costs a spurious listing entry or
+ * ref (harmless — a ref with no matching document does nothing), while
+ * omitting a ref that ingest actually indexed causes the next reconcile
+ * pass to silently archive a live document (reconcile's missing-ref
+ * contract reads an omission as an upstream deletion).
+ */
+function shortcutIgnoreIsDefinite(route: DriveRoute, targetMime: string): boolean {
+  if (route.kind !== 'ignore') return false;
+  if (targetMime.startsWith('application/vnd.google-apps.')) return true;
+  return route.reason === 'archive' || route.reason === 'cloud-media';
+}
+
+/**
  * Budgeted recursive BFS file count behind the picker's per-row "N files".
- * Each files.list PAGE spends one request of the budget; non-folders count
- * (shortcuts too — an estimate, targets are not resolved), folders enqueue.
- * Exiting with work remaining (budget spent or CAP reached, including a
- * dangling nextPageToken) → `capped: true`, count is a lower bound. Any Drive
- * error resolves `null` (uncounted row) — a count must never kill the picker.
+ * Each files.list PAGE spends one request of the budget; folders enqueue,
+ * and a non-folder counts only when `chooseRoute` would actually index it —
+ * a shortcut is resolved through its `shortcutDetails.targetMimeType` (no
+ * target fetch, still an estimate: the target's own name/size are unknown,
+ * so a target near a size cap may count optimistically). Exiting with work
+ * remaining (budget spent or CAP reached, including a dangling
+ * nextPageToken) → `capped: true`, count is a lower bound. Any Drive error
+ * resolves `null` (uncounted row) — a count must never kill the picker.
  */
 export async function countFilesUnder(
   client: DriveClient,
@@ -248,9 +303,29 @@ export async function countFilesUnder(
         for (const f of page.files ?? []) {
           if (f.mimeType === GOOGLE_FOLDER_MIME) {
             queue.push(f.id);
-          } else if (++counted >= COUNT_CAP) {
-            return { count: counted, capped: true };
+            continue;
           }
+          const isShortcut = f.mimeType === GOOGLE_SHORTCUT_MIME;
+          const targetMime = isShortcut ? f.shortcutDetails?.targetMimeType : f.mimeType;
+          if (!targetMime) continue; // detail-less shortcut: ingest skips it too
+          const size = Number(f.size);
+          // A shortcut's own name says nothing about the TARGET's extension
+          // (e.g. a shortcut named "song.mp3" pointing at a real PDF) — pass
+          // '' so chooseRoute's extension-rescue branch never fires on the
+          // wrong (shortcut's) name; only the resolved target mime decides.
+          // An 'unsupported' verdict reached that way is ambiguous — see
+          // shortcutIgnoreIsDefinite — so a shortcut is only excluded when
+          // the ignore is definite; count it (over-admit) otherwise.
+          const route = chooseRoute(
+            targetMime,
+            isShortcut ? '' : f.name,
+            Number.isFinite(size) ? size : undefined,
+          );
+          const ignored = isShortcut
+            ? shortcutIgnoreIsDefinite(route, targetMime)
+            : route.kind === 'ignore';
+          if (ignored) continue;
+          if (++counted >= COUNT_CAP) return { count: counted, capped: true };
         }
         pageToken = page.nextPageToken;
       } while (pageToken);
@@ -400,11 +475,15 @@ async function hashSkip(
   );
   if (!existing || existing.archivedAt) return false;
   const meta = existing.metadata as Record<string, unknown>;
-  // A 'failed' row (both exports exhausted — possibly just a quota storm)
-  // must be retried on the next walk/tick: never pin it behind an unchanged
-  // revision id. 'too-large'/'unsupported' rows still skip — re-fetching
-  // changes nothing for those.
-  if (meta.extraction_status === 'failed') return false;
+  // Only a clean 'ok' row is ever pinned behind an unchanged hash. A
+  // 'failed' row (both exports exhausted — possibly just a quota storm)
+  // must be retried on the next walk/tick. 'unsupported'/'too-large' rows
+  // are never produced by current routing (an ineligible file is ignored
+  // before any row is created) — reaching hashSkip here means the file's
+  // route has since flipped positive (e.g. the extension-rescue widening
+  // in decideFileIndexing, or a legacy pre-policy row); either way it must
+  // be re-fetched, not pinned as if still ineligible.
+  if (meta.extraction_status !== 'ok') return false;
   return meta[metaKey] === value;
 }
 
@@ -420,18 +499,22 @@ function metadataOnly(
 }
 
 /**
- * Route one listed/changed file into a DriveItem (or null to skip it).
- * Shortcuts resolve to their target once (shortcut-of-shortcut: warn +
- * skip), keeping the SHORTCUT's parents so the doc sits in the indexed
- * subtree (v1 ingest.ts parity). May do I/O (export/download/target fetch) —
- * toDocument stays pure.
+ * Route one listed/changed file into a BuildResult (or null: nothing
+ * changed, skip silently — shortcut-of-shortcut, a detail-less shortcut, or
+ * a hash-skip). Shortcuts resolve to their target once (shortcut-of-
+ * shortcut: warn + skip), keeping the SHORTCUT's parents so the doc sits in
+ * the indexed subtree (v1 ingest.ts parity). The policy gate
+ * (`chooseRoute`) runs FIRST — before hash-skip, before any export/download
+ * request — so an ignored file causes zero I/O beyond the shortcut-target
+ * lookup already needed to know its real mime. May do I/O (target fetch /
+ * export / download) — toDocument stays pure.
  */
 async function buildItem(
   raw: DriveFile,
   segments: string[],
   root: RootConfig,
   deps: ItemDeps,
-): Promise<DriveItem | null> {
+): Promise<BuildResult | null> {
   let file = raw;
   if (file.mimeType === GOOGLE_SHORTCUT_MIME) {
     const details = file.shortcutDetails;
@@ -447,7 +530,12 @@ async function buildItem(
   }
 
   const displayPath = [root.rootName, ...segments].join(' / ');
-  const route = chooseRoute(file.mimeType);
+  const size = Number(file.size);
+  const route = chooseRoute(file.mimeType, file.name, Number.isFinite(size) ? size : undefined);
+
+  if (route.kind === 'ignore') {
+    return { kind: 'ignored', reason: route.reason, fileId: file.id };
+  }
 
   if (route.kind === 'native') {
     if (
@@ -477,35 +565,45 @@ async function buildItem(
           'warn',
           `google-docs: export failed for ${file.id} (${errText(e2)}) — indexing metadata only`,
         );
-        return metadataOnly(file, 'gdocs.doc', 'failed', displayPath, root.rootFolderId);
+        return {
+          kind: 'item',
+          item: metadataOnly(file, 'gdocs.doc', 'failed', displayPath, root.rootFolderId),
+        };
       }
     }
     return {
-      file,
-      docType: 'gdocs.doc',
-      markdown,
-      extractionStatus: 'ok',
-      displayPath,
-      rootFolderId: root.rootFolderId,
+      kind: 'item',
+      item: {
+        file,
+        docType: 'gdocs.doc',
+        markdown,
+        extractionStatus: 'ok',
+        displayPath,
+        rootFolderId: root.rootFolderId,
+      },
     };
   }
 
-  if (route.kind === 'binary') {
-    if (await hashSkip(deps, file.id, 'file', 'md5_checksum', file.md5Checksum)) {
-      return null;
-    }
-    if (Number(file.size ?? 0) > MAX_BINARY_BYTES) {
-      return metadataOnly(file, 'file', 'too-large', displayPath, root.rootFolderId);
-    }
-    const bytes = await deps.client.request<Uint8Array>(mediaUrl(file.id), {
-      responseType: 'bytes',
-    });
-    // Post-download cap: Drive binaries virtually always carry `size`, but
-    // the cap is the guarantee — an unknown-size file must not slip past it.
-    if (bytes.byteLength > MAX_BINARY_BYTES) {
-      return metadataOnly(file, 'file', 'too-large', displayPath, root.rootFolderId);
-    }
-    return {
+  // route.kind === 'binary'
+  if (await hashSkip(deps, file.id, 'file', 'md5_checksum', file.md5Checksum)) {
+    return null;
+  }
+  const bytes = await deps.client.request<Uint8Array>(mediaUrl(file.id), {
+    responseType: 'bytes',
+  });
+  // Post-download cap: Drive binaries virtually always carry `size`, so the
+  // pre-download `chooseRoute` cap above already caught most oversized
+  // files — this is the backstop for the rare unknown-size file, re-checked
+  // AFTER download per the size-boundary contract (unknown size is admitted
+  // provisionally). A breach here is now a genuine policy ignore: the bytes
+  // are discarded, never staged as a DriveItem.
+  const binaryCap = route.pipeline === 'vision' ? MAX_CLOUD_IMAGE_BYTES : MAX_BINARY_BYTES;
+  if (bytes.byteLength > binaryCap) {
+    return { kind: 'ignored', reason: 'too-large', fileId: file.id };
+  }
+  return {
+    kind: 'item',
+    item: {
       file,
       docType: 'file',
       markdown: null,
@@ -513,10 +611,8 @@ async function buildItem(
       extractionStatus: 'ok',
       displayPath,
       rootFolderId: root.rootFolderId,
-    };
-  }
-
-  return metadataOnly(file, 'file', 'unsupported', displayPath, root.rootFolderId);
+    },
+  };
 }
 
 /**
@@ -558,6 +654,12 @@ async function* backfill(
   const walked = new Set<string>(roots.map((r) => r.rootFolderId));
   const queue: { folderId: string; segments: string[]; root: RootConfig; pageToken?: string }[] =
     roots.map((r) => ({ folderId: r.rootFolderId, segments: [], root: r }));
+  // Ignored files are dropped silently per-file (no deletion — a re-walked
+  // policy transition has no local row to archive yet; a genuine leftover
+  // from before a policy tightening is caught by the next reconcile). Counts
+  // are aggregated across the WHOLE walk and logged once at the end —
+  // never per-file, and never with a filename.
+  const ignoreCounts: Partial<Record<FileIgnoreReason, number>> = {};
 
   while (queue.length > 0) {
     if (session.signal.aborted) return;
@@ -583,21 +685,42 @@ async function* backfill(
         continue;
       }
       try {
-        const item = await buildItem(f, head.segments, head.root, deps);
-        if (item) acc.add(item);
+        const built = await buildItem(f, head.segments, head.root, deps);
+        if (built) {
+          if (built.kind === 'item') {
+            acc.add(built.item);
+          } else {
+            ignoreCounts[built.reason] = (ignoreCounts[built.reason] ?? 0) + 1;
+          }
+        }
       } catch (e) {
         // One unreadable file must not abort the walk (v1 backfill parity).
         if (isAuthError(e)) throw e;
         session.log('warn', `google-docs backfill: file ${f.id} skipped: ${errText(e)}`);
       }
-      if (acc.full()) yield { phase: 'backfill', items: acc.take().items, cursor: walkCursor };
+      if (acc.full()) {
+        const chunk = acc.take();
+        yield { phase: 'backfill', items: chunk.items, deletions: chunk.deletions, cursor: walkCursor };
+      }
     }
 
-    yield { phase: 'backfill', items: acc.take().items, cursor: walkCursor };
+    const chunk = acc.take();
+    yield { phase: 'backfill', items: chunk.items, deletions: chunk.deletions, cursor: walkCursor };
 
     if (page.nextPageToken) {
       queue.unshift({ ...head, pageToken: page.nextPageToken });
     }
+  }
+
+  const ignoreTotal = Object.values(ignoreCounts).reduce((a, b) => a + (b ?? 0), 0);
+  if (ignoreTotal > 0) {
+    const summary = Object.entries(ignoreCounts)
+      .map(([reason, n]) => `${reason}=${n}`)
+      .join(', ');
+    session.log(
+      'info',
+      `google-docs backfill: ignored ${ignoreTotal} file(s) by policy (${summary})`,
+    );
   }
 
   yield { phase: 'live', items: [], cursor: { page_token: pageToken, backfill_done: true } };
@@ -753,8 +876,10 @@ async function* delta(
         acc.addDeletions(await existingRefs(query, session, c.fileId));
         return;
       }
-      const item = await buildItem(c.file, scope.segments, byRootId.get(scope.rootId!)!, deps);
-      if (item) acc.add(item);
+      const built = await buildItem(c.file, scope.segments, byRootId.get(scope.rootId!)!, deps);
+      if (!built) return; // hash-skip: unchanged, still-live — nothing to do
+      if (built.kind === 'item') acc.add(built.item);
+      else acc.addDeletions(await existingRefs(query, session, built.fileId));
     };
     for (const c of byId.values()) {
       if (session.signal.aborted) return;
@@ -934,16 +1059,17 @@ export function createGoogleDocsSource(
     /** Random-access bytes for the engine's deep-extraction passes (the
      *  vision worker's OCR/VLM two-pass pulls pdf/image bytes back through
      *  here). Native docs return null — their markdown is already in the
-     *  document. */
+     *  document. The `chooseRoute` gate runs BEFORE `clientFor`/any request,
+     *  so an ignored doc costs no OAuth/token/network work at all. */
     async fetchBytes(session: Session, doc: Document): Promise<Uint8Array | null> {
       if (doc.type === 'gdocs.doc') return null;
       const meta = doc.metadata as Record<string, unknown>;
       const fileId = meta.drive_file_id;
       if (typeof fileId !== 'string' || !fileId) return null;
       const mime = typeof meta.mime_type === 'string' ? meta.mime_type : '';
-      if (!isConvertibleMime(mime)) return null;
-      const size = Number(meta.size_bytes ?? 0);
-      if (Number.isFinite(size) && size > MAX_BINARY_BYTES) return null;
+      const filename = doc.title ?? '';
+      const size = typeof meta.size_bytes === 'number' ? meta.size_bytes : undefined;
+      if (chooseRoute(mime, filename, size).kind !== 'binary') return null;
       const client = clientFor(session);
       try {
         return await client.request<Uint8Array>(mediaUrl(fileId), {
@@ -960,10 +1086,14 @@ export function createGoogleDocsSource(
     /**
      * Full BFS listing of what exists under ALL configured roots. Refs carry
      * the type the ROUTING would emit (native docs → 'gdocs.doc', everything
-     * else → 'file'; shortcuts → the TARGET id, matching ingest). ANY listing
-     * failure THROWS — the engine treats a thrown reconcile as a partial
-     * listing and skips the deletion diff; yielding a partial live-set would
-     * mass-archive documents.
+     * else → 'file'; shortcuts → the TARGET id, matching ingest). A file (or
+     * shortcut target) `chooseRoute` would ignore is OMITTED — the engine
+     * diffs this live set against the local corpus, so an omitted ref reads
+     * as "gone" and archives any leftover row from before a policy
+     * tightening, exactly like a real deletion. ANY listing failure THROWS —
+     * the engine treats a thrown reconcile as a partial listing and skips
+     * the deletion diff; yielding a partial live-set would mass-archive
+     * documents.
      */
     async *reconcile(session: Session): AsyncIterable<ExternalRef[]> {
       const client = clientFor(session);
@@ -992,10 +1122,28 @@ export function createGoogleDocsSource(
               const details = f.shortcutDetails;
               // Matches ingest: detail-less and shortcut-of-shortcut skipped.
               if (!details || details.targetMimeType === GOOGLE_SHORTCUT_MIME) continue;
+              // No target name/size in this listing — resolved as today
+              // (target mime only), then gated the same as an ordinary file.
+              // The shortcut's OWN name is never passed here: a shortcut
+              // named "song.mp3" pointing at a real PDF must not trip the
+              // extension-rescue branch on the wrong file's name. But an
+              // 'unsupported' verdict reached that way is ambiguous — see
+              // shortcutIgnoreIsDefinite — so only a DEFINITE ignore is
+              // omitted here; an ambiguous one is over-admitted (a phantom
+              // ref costs nothing; an omitted one gets archived next pass).
+              const shortcutRoute = chooseRoute(details.targetMimeType, '');
+              if (shortcutIgnoreIsDefinite(shortcutRoute, details.targetMimeType)) continue;
               refs.push({
                 externalId: details.targetId,
                 type: details.targetMimeType === GOOGLE_DOC_MIME ? 'gdocs.doc' : 'file',
               });
+              continue;
+            }
+            const size = Number(f.size);
+            if (
+              chooseRoute(f.mimeType, f.name, Number.isFinite(size) ? size : undefined).kind ===
+              'ignore'
+            ) {
               continue;
             }
             refs.push({
