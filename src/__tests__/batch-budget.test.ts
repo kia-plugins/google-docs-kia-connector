@@ -30,7 +30,7 @@ import {
 
 type B = Batch<DriveCursor, DriveItem>;
 const ids = (b: B) => b.items.map((i) => i.file.id);
-const LIVE = { page_token: 'pt-1', backfill_done: true };
+const LIVE = { page_token: 'pt-1', backfill_done: true, scope_roots: ['root'] };
 const bytes = (n: number) => new Uint8Array(n).fill(7);
 
 function makeSource(
@@ -72,8 +72,8 @@ describe('batch byte budget', () => {
     const batches = (await collect(source.pull(session, LIVE))) as B[];
 
     expect(batches.map(ids)).toEqual([['a', 'b'], ['c']]);
-    expect(batches[0].cursor).toEqual({ page_token: 'pt-1', backfill_done: true });
-    expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-1', backfill_done: true, scope_roots: ['root'] });
+    expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
   });
 
   it('delta: native-export markdown counts against the budget too', async () => {
@@ -98,8 +98,8 @@ describe('batch byte budget', () => {
     const batches = (await collect(source.pull(session, LIVE))) as B[];
 
     expect(batches.map(ids)).toEqual([['d1', 'd2'], ['d3']]);
-    expect(batches[0].cursor).toEqual({ page_token: 'pt-1', backfill_done: true });
-    expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-1', backfill_done: true, scope_roots: ['root'] });
+    expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
   });
 
   it('delta: markdown is budgeted in UTF-8 bytes, not UTF-16 code units', async () => {
@@ -149,8 +149,8 @@ describe('batch byte budget', () => {
     const batches = (await collect(source.pull(session, LIVE))) as B[];
 
     expect(batches.map(ids)).toEqual([['a', 'b'], []]);
-    expect(batches[0].cursor).toEqual({ page_token: 'pt-1', backfill_done: true });
-    expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-1', backfill_done: true, scope_roots: ['root'] });
+    expect(batches[1].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
   });
 
   it('delta: the item limit flushes ordinary items and deletions together; each deletion lands in exactly one chunk', async () => {
@@ -183,7 +183,7 @@ describe('batch byte budget', () => {
       ['gone2'],
     ]);
     expect(batches.slice(0, -1).every((b) => b.cursor.page_token === 'pt-1')).toBe(true);
-    expect(batches.at(-1)!.cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    expect(batches.at(-1)!.cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
   });
 
   it('delta: a policy-ignored file (no local row) costs the item limit nothing — it never enters the accumulator', async () => {
@@ -229,9 +229,9 @@ describe('batch byte budget', () => {
 
     expect(batches.map(ids)).toEqual([['a', 'b'], ['c'], []]);
     expect(batches.map((b) => b.phase)).toEqual(['backfill', 'backfill', 'live']);
-    expect(batches[0].cursor).toEqual({ page_token: 'spt-1', backfill_done: false });
-    expect(batches[1].cursor).toEqual({ page_token: 'spt-1', backfill_done: false });
-    expect(batches[2].cursor).toEqual({ page_token: 'spt-1', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'spt-1', backfill_done: false, scope_roots: ['root'] });
+    expect(batches[1].cursor).toEqual({ page_token: 'spt-1', backfill_done: false, scope_roots: ['root'] });
+    expect(batches[2].cursor).toEqual({ page_token: 'spt-1', backfill_done: true, scope_roots: ['root'] });
   });
 
   it('never splits a page when the budget is not reached (unchanged one-batch-per-page behaviour)', async () => {
@@ -252,6 +252,6 @@ describe('batch byte budget', () => {
     const batches = (await collect(source.pull(session, LIVE))) as B[];
 
     expect(batches.map(ids)).toEqual([['a', 'b']]);
-    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
   });
 });

@@ -99,6 +99,12 @@ const SHORTCUT_TARGET_FIELDS =
 export interface DriveCursor {
   page_token: string;
   backfill_done: boolean;
+  /** The canonical root ids (config ids, `'root'` alias included) that
+   *  produced this cursor, sorted and deduped. OPTIONAL on purpose: core's
+   *  v3 migration leaves `Account.cursor` untouched because it is opaque to
+   *  core, so a pre-existing cursor arrives without it — and `pull()` treats
+   *  absent as a mismatch, i.e. exactly one forced backfill per account. */
+  scope_roots?: string[];
 }
 
 export interface DriveFile {
@@ -336,19 +342,37 @@ export async function countFilesUnder(
   }
 }
 
-/** Normalize account config to the tracked roots. Accepts the multi-root
- *  shape (`roots: [{ rootFolderId, rootName }]`) or nothing (all of My
- *  Drive). Per-entry name fallback: 'My Drive' for the 'root' alias, the
- *  id otherwise. Deduped by rootFolderId — first entry wins. */
+/** Normalize account config to the tracked roots. Canonical shape first
+ *  (`folderRoots: [{ id, name }]`), then the legacy `roots:
+ *  [{ rootFolderId, rootName }]` mirror, then nothing (all of My Drive).
+ *  Per-entry name fallback: 'My Drive' for the 'root' alias, the id
+ *  otherwise. Deduped by id — first entry wins.
+ *
+ *  The mirror is core's ONE-TRAIN compatibility write (DECISIONS R1, owner
+ *  fixed by A-2): the v3 migration and `applyFolderScope` keep `roots` in
+ *  sync with `folderRoots` so a still-installed 2.1.6 — which reads only
+ *  `roots` and silently falls through to ALL of My Drive without it — keeps
+ *  working. This connector READS it only as a fallback, for an account this
+ *  core has not migrated (an older core, or a config written before the
+ *  migration ran), and never writes or deletes it.
+ *  TODO(folder-scope-train-2): drop the legacy roots fallback. */
 export function rootsConfig(session: Session): RootConfig[] {
-  const cfg = session.account.config as { roots?: unknown };
+  const cfg = session.account.config as { folderRoots?: unknown; roots?: unknown };
   const nameFor = (id: string, name: unknown): string => {
     if (typeof name === 'string' && name) return name;
     return id === 'root' ? 'My Drive' : id;
   };
 
   const parsed: RootConfig[] = [];
-  if (Array.isArray(cfg.roots)) {
+  if (Array.isArray(cfg.folderRoots)) {
+    for (const raw of cfg.folderRoots) {
+      const r = raw as { id?: unknown; name?: unknown } | null;
+      if (r && typeof r.id === 'string' && r.id) {
+        parsed.push({ rootFolderId: r.id, rootName: nameFor(r.id, r.name) });
+      }
+    }
+  }
+  if (parsed.length === 0 && Array.isArray(cfg.roots)) {
     for (const raw of cfg.roots) {
       const r = raw as { rootFolderId?: unknown; rootName?: unknown } | null;
       if (r && typeof r.rootFolderId === 'string' && r.rootFolderId) {
@@ -372,6 +396,44 @@ export function rootsConfig(session: Session): RootConfig[] {
     deduped.push(r);
   }
   return deduped;
+}
+
+/** The canonical root-id set for a cursor: deduped and SORTED, so a cursor
+ *  read back by a human is stable. Comparison is still set-wise. */
+const scopeRootIds = (roots: RootConfig[]): string[] =>
+  [...new Set(roots.map((r) => r.rootFolderId))].sort();
+
+/** Order-independent set equality on root ids — a REORDERED root list must
+ *  never force a re-walk. An absent/non-array `a` is a mismatch (see
+ *  DriveCursor.scope_roots). */
+export function sameRootSet(a: string[] | undefined, b: string[]): boolean {
+  if (!Array.isArray(a)) return false;
+  const left = new Set(a);
+  const right = new Set(b);
+  if (left.size !== right.size) return false;
+  for (const id of right) if (!left.has(id)) return false;
+  return true;
+}
+
+/**
+ * Stamps the CURRENT root set onto every cursor leaving `pull()`.
+ *
+ * There are six cursor yield sites — `:703` and `:708` (backfill's
+ * `walkCursor`), `:726` (the live flip), `:845` (invalid-token recovery),
+ * `:896` (delta's `pageCursor`) and `:906` (the page advance) — and because
+ * `pull()` gates the phase on `scope_roots`, a SINGLE un-stamped site is an
+ * infinite re-walk: the next tick reads `undefined`, mismatches, and
+ * backfills again. Funnelling every yield through one wrapper makes that
+ * unmissable, and keeps a future seventh site correct by construction. Do
+ * NOT also edit the six literals — one owner only.
+ */
+async function* withScopeRoots(
+  batches: AsyncGenerator<Batch<DriveCursor, DriveItem>>,
+  scopeRoots: string[],
+): AsyncGenerator<Batch<DriveCursor, DriveItem>> {
+  for await (const batch of batches) {
+    yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots } };
+  }
 }
 
 function listUrl(folderId: string, pageToken?: string): string {
@@ -1009,10 +1071,25 @@ export function createGoogleDocsSource(
     async *pull(session: Session, cursor: DriveCursor | null) {
       const client = clientFor(session);
       const roots = rootsConfig(session);
-      if (!cursor || !cursor.backfill_done) {
-        yield* backfill(client, session, host.query, cursor, roots, budget);
+      const scopeRoots = scopeRootIds(roots);
+      // Phase switch. A finished backfill is trusted ONLY while the cursor
+      // was produced by the current root set: adding a root after
+      // backfill_done otherwise never walks the files that predate the
+      // cursor (the gap this feature exists to close). On a mismatch the
+      // walk keeps the saved page_token — backfill's own comment says why:
+      //   "A non-empty saved page_token predates the interrupted walk — a
+      //    superset of the changes we might miss — so KEEP it; never
+      //    recapture mid-backfill."   (source.ts:634-635)
+      if (!cursor || !cursor.backfill_done || !sameRootSet(cursor.scope_roots, scopeRoots)) {
+        yield* withScopeRoots(
+          backfill(client, session, host.query, cursor, roots, budget),
+          scopeRoots,
+        );
       } else {
-        yield* delta(client, session, host.query, cursor, roots, budget);
+        yield* withScopeRoots(
+          delta(client, session, host.query, cursor, roots, budget),
+          scopeRoots,
+        );
       }
     },
 
@@ -1023,6 +1100,23 @@ export function createGoogleDocsSource(
         type: item.docType,
         title: f.name,
         markdown: item.markdown,
+        // First-class root attribution (spec §Document root attribution).
+        // The CONFIG id verbatim — 'root' alias included — so it equals
+        // metadata.root_folder_id below and folderRoots[].id in config;
+        // core's applyFolderScope matches archiveScopeRootIds against
+        // exactly this column, with an IN-list (R8), never a NOT-IN.
+        // Never undefined here: every DriveItem is built under a RootConfig
+        // (backfill seeds one per queue entry, delta maps resolveScope's hit
+        // back through byRootId), so this connector never EMITS an R5 NULL.
+        // NULL rows can still exist on a Drive account from the migration
+        // path (Task 2's mass-archive refusal and its unreadable-metadata
+        // guards leave rows live with scope_root_id NULL). `manageFolders`
+        // below still ASKS for the archiveNullScoped repair on those rows,
+        // but core declines to act on it in this train (C-34), so such rows
+        // stay live and unattributed rather than being archived. That is the
+        // intended outcome: no path in this train archives a document the
+        // migration could not attribute.
+        scopeRootId: item.rootFolderId,
         ...(item.bytes
           ? { binary: { bytes: item.bytes, mime: f.mimeType, filename: f.name } }
           : {}),

@@ -30,7 +30,7 @@ import {
 
 type B = Batch<DriveCursor, DriveItem>;
 
-const LIVE = { page_token: 'pt-1', backfill_done: true };
+const LIVE = { page_token: 'pt-1', backfill_done: true, scope_roots: ['root'] };
 
 function makeSource(world: Parameters<typeof driveFetch>[0], query = fakeQuery()) {
   const { fetchFn, calls } = driveFetch(world);
@@ -58,7 +58,7 @@ describe('delta', () => {
     expect(batches[0].items.map((i) => i.file.id)).toEqual(['docA']);
     expect(batches[0].items[0].markdown).toBe('# Doc A v2');
     expect(batches[0].deletions).toEqual([]);
-    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
     // My Drive root resolved once for the scope walk ('root' is an alias).
     expect(calls.filter((u) => u.includes('/files/root'))).toHaveLength(1);
   });
@@ -332,7 +332,7 @@ describe('delta', () => {
 
     expect(batches[0].items.map((i) => i.file.id)).toEqual(['good1']);
     expect(logs.some((l) => l.level === 'warn' && /file bad1 skipped/.test(l.msg))).toBe(true);
-    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
   });
 
   it('commits per page: crash between pages resumes at nextPageToken', async () => {
@@ -354,8 +354,8 @@ describe('delta', () => {
     const batches = (await collect(source.pull(session, LIVE))) as B[];
 
     expect(batches).toHaveLength(2);
-    expect(batches[0].cursor).toEqual({ page_token: 'pt-2', backfill_done: true });
-    expect(batches[1].cursor).toEqual({ page_token: 'nspt-9', backfill_done: true });
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-2', backfill_done: true, scope_roots: ['root'] });
+    expect(batches[1].cursor).toEqual({ page_token: 'nspt-9', backfill_done: true, scope_roots: ['root'] });
   });
 
   it('dedupes a page by fileId keeping the LAST change', async () => {
@@ -388,11 +388,11 @@ describe('delta', () => {
     const { session, logs } = makeSession();
 
     const batches = (await collect(
-      source.pull(session, { page_token: 'pt-bad', backfill_done: true }),
+      source.pull(session, { page_token: 'pt-bad', backfill_done: true, scope_roots: ['root'] }),
     )) as B[];
 
     expect(batches).toEqual([
-      { phase: 'live', items: [], cursor: { page_token: '', backfill_done: false } },
+      { phase: 'live', items: [], cursor: { page_token: '', backfill_done: false, scope_roots: ['root'] } },
     ]);
     expect(logs.some((l) => l.level === 'warn' && /page token rejected/.test(l.msg))).toBe(true);
   });
@@ -410,7 +410,7 @@ describe('delta', () => {
     const { session } = makeSession();
 
     await expect(
-      collect(source.pull(session, { page_token: 'pt-40404', backfill_done: true })),
+      collect(source.pull(session, { page_token: 'pt-40404', backfill_done: true, scope_roots: ['root'] })),
     ).rejects.toThrow(/drive 500/);
   });
 
@@ -453,7 +453,9 @@ describe('delta', () => {
       },
     });
 
-    const batches = (await collect(source.pull(session, LIVE))) as B[];
+    const batches = (await collect(
+      source.pull(session, { ...LIVE, scope_roots: ['FOLD1', 'FOLD2'] }),
+    )) as B[];
 
     // No 'root' alias among the tracked roots → no files/root resolution.
     expect(calls.some((u) => u.includes('/files/root'))).toBe(false);
@@ -486,7 +488,9 @@ describe('delta', () => {
       },
     });
 
-    const batches = (await collect(source.pull(session, LIVE))) as B[];
+    const batches = (await collect(
+      source.pull(session, { ...LIVE, scope_roots: ['FOLD1', 'root'] }),
+    )) as B[];
 
     expect(calls.filter((u) => u.includes('/files/root'))).toHaveLength(1);
     expect(batches[0].items.map((i) => i.rootFolderId).sort()).toEqual(['FOLD1', 'root']);
@@ -515,7 +519,9 @@ describe('delta', () => {
       config: { roots: [{ rootFolderId: 'FOLD1', rootName: 'Projects' }] },
     });
 
-    const batches = (await collect(source.pull(session, LIVE))) as B[];
+    const batches = (await collect(
+      source.pull(session, { ...LIVE, scope_roots: ['FOLD1'] }),
+    )) as B[];
 
     expect(calls.some((u) => u.includes('/files/root'))).toBe(false);
     expect(batches[0].items.map((i) => i.file.id)).toEqual(['in1']);

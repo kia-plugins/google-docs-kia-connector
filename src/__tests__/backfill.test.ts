@@ -60,12 +60,12 @@ describe('backfill', () => {
     expect(calls[0]).toContain('/changes/startPageToken');
     // Cursor unchanged all walk long; only the final batch flips.
     for (const b of batches.slice(0, 3)) {
-      expect(b.cursor).toEqual({ page_token: 'spt-1', backfill_done: false });
+      expect(b.cursor).toEqual({ page_token: 'spt-1', backfill_done: false, scope_roots: ['root'] });
     }
     expect(batches[3]).toEqual({
       phase: 'live',
       items: [],
-      cursor: { page_token: 'spt-1', backfill_done: true },
+      cursor: { page_token: 'spt-1', backfill_done: true, scope_roots: ['root'] },
     });
     // Page-aligned batches in BFS order: root p0, root p1, then Sub.
     expect(ids(batches[0])).toEqual(['docA']);
@@ -350,10 +350,11 @@ describe('backfill', () => {
     )) as B[];
 
     expect(calls.some((u) => u.includes('startPageToken'))).toBe(false);
-    expect(batches[0].cursor).toEqual({ page_token: 'pt-keep', backfill_done: false });
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-keep', backfill_done: false, scope_roots: ['root'] });
     expect(batches[batches.length - 1].cursor).toEqual({
       page_token: 'pt-keep',
       backfill_done: true,
+      scope_roots: ['root'],
     });
   });
 
@@ -372,6 +373,7 @@ describe('backfill', () => {
     expect(batches[batches.length - 1].cursor).toEqual({
       page_token: 'spt-fresh',
       backfill_done: true,
+      scope_roots: ['root'],
     });
   });
 
@@ -411,7 +413,7 @@ describe('backfill', () => {
     expect(batches[batches.length - 1]).toEqual({
       phase: 'live',
       items: [],
-      cursor: { page_token: 'spt-1', backfill_done: true },
+      cursor: { page_token: 'spt-1', backfill_done: true, scope_roots: ['FA', 'FB'] },
     });
   });
 
