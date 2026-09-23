@@ -31,7 +31,9 @@
  *  4. `sleep`/`random` are injectable so tests never actually wait.
  */
 
-export type NetFetch = (url: string, init?: unknown) => Promise<unknown>;
+// The host's own net.fetch type (PluginNet['fetch']), via the SDK.
+import type { NetFetch } from '@kiagent/connector-sdk/http';
+export type { NetFetch };
 
 export type ResponseType = 'json' | 'text' | 'bytes';
 
