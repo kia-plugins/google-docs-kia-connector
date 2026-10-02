@@ -369,6 +369,7 @@ export function fakeDoc(
     createdAt: null,
     contentHash: 'hash-x',
     seq: 1,
+    ingestSeq: 1,
     archivedAt: null,
     scopeRootId: null,
     languages: [],
