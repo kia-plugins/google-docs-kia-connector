@@ -42,7 +42,7 @@ import type {
   Session,
   Source,
 } from '@kiagent/connector-sdk';
-import { MAX_CLOUD_BINARY_BYTES, MAX_CLOUD_IMAGE_BYTES } from '@kiagent/connector-sdk';
+import { MAX_CLOUD_BINARY_BYTES } from '@kiagent/connector-sdk';
 import {
   DriveApiError,
   DriveClient,
@@ -57,15 +57,17 @@ import {
   GOOGLE_DOC_MIME,
   GOOGLE_FOLDER_MIME,
   GOOGLE_SHORTCUT_MIME,
+  statusFor,
   type DriveRoute,
 } from './export-map';
 
 export const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 export const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
-/** Binary/PDF/Office cap — delegated to the SDK's canonical cloud-drive
- *  policy so this connector never drifts from it (v1 had NO cap at all —
- *  whole file into a Buffer, v1 gap #6). Images have their own, smaller
- *  cap (`MAX_CLOUD_IMAGE_BYTES`) applied inside `chooseRoute`. */
+/** The eager (download-at-ingest) cap — the SDK's canonical cloud-drive
+ *  policy, so this connector never drifts from it (v1 had NO cap at all —
+ *  whole file into a Buffer, v1 gap #6). Documents over it keep a
+ *  metadata-only row; images over the smaller image cap are ignored, both
+ *  inside `chooseRoute`. */
 export const MAX_BINARY_BYTES = MAX_CLOUD_BINARY_BYTES;
 
 /**
@@ -133,7 +135,10 @@ export interface DriveItem {
    *  binary items (the engine converts `binary` bytes). */
   markdown: string | null;
   bytes?: Uint8Array;
-  extractionStatus: 'ok' | 'unsupported' | 'too-large' | 'failed';
+  /** `'deferred'`/`'none'`: a document over the eager cap (metadata-only;
+   *  core's convert worker fetches a deferred one). `'unsupported'` and
+   *  `'too-large'` are legacy values, read but never written. */
+  extractionStatus: 'ok' | 'deferred' | 'none' | 'unsupported' | 'too-large' | 'failed';
   displayPath: string;
   rootFolderId: string;
 }
@@ -520,17 +525,26 @@ class ChunkAccumulator {
   }
 }
 
-/** Query-first content-hash skip: an unchanged, still-live document is never
- *  re-exported / re-downloaded (v1 ingest.ts's metadata-only refresh, minus
- *  the metadata refresh — the v2 engine owns row freshness). An ARCHIVED
- *  match does NOT skip: re-emitting is what un-archives a doc that moved
- *  back into scope. */
+/** Query-first content-hash skip: an unchanged, still-live document whose
+ *  stored `extraction_status` is the one the CURRENT route would write is
+ *  never re-exported / re-downloaded (v1 ingest.ts's metadata-only refresh,
+ *  minus the metadata refresh — the v2 engine owns row freshness). For a
+ *  `'deferred'` row this keeps the convert worker's text: re-emitting
+ *  `markdown: ''` would discard it. An ARCHIVED match does NOT skip
+ *  (re-emitting un-archives a doc that moved back into scope). `'failed'`
+ *  (both exports exhausted — possibly a quota storm), legacy
+ *  `'unsupported'`/`'too-large'`, and any route change re-fetch. When
+ *  upstream sent no size, `recheck` routes by the size measured on an earlier
+ *  download (`size_bytes`), or a size-less file would re-download every walk. */
+type Status = 'ok' | 'deferred' | 'none';
 async function hashSkip(
   deps: ItemDeps,
   fileId: string,
   type: 'gdocs.doc' | 'file',
   metaKey: 'head_revision_id' | 'md5_checksum',
   value: string | undefined,
+  want: Status = 'ok',
+  recheck?: (storedSize: number) => Status | 'ignore',
 ): Promise<boolean> {
   if (!value) return false;
   const existing = await deps.query.byExternalId(
@@ -540,26 +554,24 @@ async function hashSkip(
   );
   if (!existing || existing.archivedAt) return false;
   const meta = existing.metadata as Record<string, unknown>;
-  // Only a clean 'ok' row is ever pinned behind an unchanged hash. A
-  // 'failed' row (both exports exhausted — possibly just a quota storm)
-  // must be retried on the next walk/tick. 'unsupported'/'too-large' rows
-  // are never produced by current routing (an ineligible file is ignored
-  // before any row is created) — reaching hashSkip here means the file's
-  // route has since flipped positive (e.g. the extension-rescue widening
-  // in decideFileIndexing, or a legacy pre-policy row); either way it must
-  // be re-fetched, not pinned as if still ineligible.
-  if (meta.extraction_status !== 'ok') return false;
-  return meta[metaKey] === value;
+  if (meta[metaKey] !== value) return false;
+  if (meta.extraction_status === want) return true;
+  return (
+    recheck !== undefined &&
+    typeof meta.size_bytes === 'number' &&
+    meta.extraction_status === recheck(meta.size_bytes)
+  );
 }
 
 function metadataOnly(
   file: DriveFile,
   docType: 'gdocs.doc' | 'file',
-  extractionStatus: 'unsupported' | 'too-large' | 'failed',
+  extractionStatus: 'deferred' | 'none' | 'failed',
   displayPath: string,
   rootFolderId: string,
 ): DriveItem {
-  // EMPTY-STRING markdown: no binary, no conversion enrollment.
+  // EMPTY-STRING markdown, no binary: core's convert worker enrolls a
+  // `deferred` row and fetches it through `fetchBytes`.
   return { file, docType, markdown: '', extractionStatus, displayPath, rootFolderId };
 }
 
@@ -650,21 +662,39 @@ async function buildItem(
   }
 
   // route.kind === 'binary'
-  if (await hashSkip(deps, file.id, 'file', 'md5_checksum', file.md5Checksum)) {
+  const recheck = Number.isFinite(size)
+    ? undefined
+    : (n: number): Status | 'ignore' => {
+        const r = chooseRoute(file.mimeType, file.name, n);
+        return r.kind === 'binary' ? statusFor(r) : 'ignore';
+      };
+  if (
+    await hashSkip(deps, file.id, 'file', 'md5_checksum', file.md5Checksum, statusFor(route), recheck)
+  ) {
     return null;
+  }
+  // A document over the eager cap: a findable row, never downloaded here.
+  if (route.bytes !== 'eager') {
+    return {
+      kind: 'item',
+      item: metadataOnly(file, 'file', route.bytes, displayPath, root.rootFolderId),
+    };
   }
   const bytes = await deps.client.request<Uint8Array>(mediaUrl(file.id), {
     responseType: 'bytes',
   });
-  // Post-download cap: Drive binaries virtually always carry `size`, so the
-  // pre-download `chooseRoute` cap above already caught most oversized
-  // files — this is the backstop for the rare unknown-size file, re-checked
-  // AFTER download per the size-boundary contract (unknown size is admitted
-  // provisionally). A breach here is now a genuine policy ignore: the bytes
-  // are discarded, never staged as a DriveItem.
-  const binaryCap = route.pipeline === 'vision' ? MAX_CLOUD_IMAGE_BYTES : MAX_BINARY_BYTES;
-  if (bytes.byteLength > binaryCap) {
-    return { kind: 'ignored', reason: 'too-large', fileId: file.id };
+  // Post-download re-check for the rare unknown-size file: the SAME policy
+  // on the real length (unknown size is admitted provisionally).
+  const post = chooseRoute(file.mimeType, file.name, bytes.byteLength);
+  if (post.kind === 'ignore') return { kind: 'ignored', reason: post.reason, fileId: file.id };
+  if (post.kind === 'binary' && post.bytes !== 'eager') {
+    // Record the measured size: a size-less row would be re-routed as eager
+    // by fetchBytes and core's convert worker, and downloaded again.
+    const sized = { ...file, size: String(bytes.byteLength) };
+    return {
+      kind: 'item',
+      item: metadataOnly(sized, 'file', post.bytes, displayPath, root.rootFolderId),
+    };
   }
   return {
     kind: 'item',
@@ -1687,7 +1717,8 @@ export function createGoogleDocsSource(
       const mime = typeof meta.mime_type === 'string' ? meta.mime_type : '';
       const filename = doc.title ?? '';
       const size = typeof meta.size_bytes === 'number' ? meta.size_bytes : undefined;
-      if (chooseRoute(mime, filename, size).kind !== 'binary') return null;
+      const route = chooseRoute(mime, filename, size);
+      if (route.kind !== 'binary' || route.bytes === 'none') return null;
       const client = clientFor(session);
       try {
         return await client.request<Uint8Array>(mediaUrl(fileId), {

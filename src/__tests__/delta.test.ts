@@ -151,7 +151,39 @@ describe('delta', () => {
     expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
   });
 
-  it('a post-download too-large ignore (unknown pre-download size) still emits a deletion for a pre-existing live row', async () => {
+  it('a post-download too-large IMAGE (unknown pre-download size) still emits a deletion for a pre-existing live row', async () => {
+    // Unknown size is admitted PROVISIONALLY pre-download (chooseRoute has
+    // no size to cap on) — the change is downloaded, and only THEN does the
+    // post-download backstop discover it exceeds the cap. That 'ignored'
+    // BuildResult must be treated the same as a pre-download ignore: a
+    // deletion ref for the pre-existing row, not silence.
+    const query = fakeQuery([fakeDoc('nosize1', 'file', {})]);
+    const { source, calls } = makeSource(
+      {
+        changes: {
+          'pt-1': {
+            changes: [
+              { fileId: 'nosize1', file: binaryFile('nosize1', 'n.png', 'image/png', { size: undefined }) },
+            ],
+            newStartPageToken: 'nspt-2',
+          },
+        },
+        media: { nosize1: new Uint8Array(30 * 1024 * 1024) },
+      },
+      query,
+    );
+    const { session } = makeSession();
+
+    const batches = (await collect(source.pull(session, LIVE))) as B[];
+
+    // The download DID happen (unknown size was admitted provisionally)...
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(true);
+    // ...but the oversized bytes are discarded: no item, one deletion ref.
+    expect(batches[0].items).toEqual([]);
+    expect(batches[0].deletions).toEqual([{ externalId: 'nosize1', type: 'file' }]);
+  });
+
+  it('a post-download oversized PDF (unknown pre-download size) becomes a deferred item — no deletion', async () => {
     // Unknown size is admitted PROVISIONALLY pre-download (chooseRoute has
     // no size to cap on) — the change is downloaded, and only THEN does the
     // post-download backstop discover it exceeds the cap. That 'ignored'
@@ -176,11 +208,11 @@ describe('delta', () => {
 
     const batches = (await collect(source.pull(session, LIVE))) as B[];
 
-    // The download DID happen (unknown size was admitted provisionally)...
     expect(calls.some((u) => u.includes('alt=media'))).toBe(true);
-    // ...but the oversized bytes are discarded: no item, one deletion ref.
-    expect(batches[0].items).toEqual([]);
-    expect(batches[0].deletions).toEqual([{ externalId: 'nosize1', type: 'file' }]);
+    expect(batches[0].items.map((it) => [it.file.id, it.extractionStatus, it.bytes])).toEqual([
+      ['nosize1', 'deferred', undefined],
+    ]);
+    expect(batches[0].deletions ?? []).toEqual([]);
   });
 
   it('a shortcut whose target mime is audio/mpeg is ignored after target resolution: deletion when a local row exists, no download', async () => {

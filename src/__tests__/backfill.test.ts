@@ -11,7 +11,9 @@ import {
   type DriveItem,
 } from '../source';
 import { GoogleDocsAuthError } from '../client';
-import type { Batch } from '@kiagent/connector-sdk';
+import { MAX_FETCH_BYTES, type Batch, type DocumentInput } from '@kiagent/connector-sdk';
+
+const MiB = 1024 * 1024;
 import {
   binaryFile,
   collect,
@@ -158,8 +160,8 @@ describe('backfill', () => {
     expect(calls.filter((u) => u.includes('sheet1'))).toEqual([]);
   });
 
-  it('ignores a too-large binary before download (no alt=media call, zero items)', async () => {
-    const big = pdf('big1', 'huge.pdf', { size: String(26 * 1024 * 1024) });
+  it('ignores a too-large image before download (no alt=media call, zero items)', async () => {
+    const big = binaryFile('big1', 'huge.png', 'image/png', { size: String(30 * MiB) });
     const { source, calls } = makeSource({ lists: { root: [big] } });
     const { session } = makeSession();
 
@@ -289,10 +291,10 @@ describe('backfill', () => {
     expect(batches.flatMap(ids)).toEqual(['x']);
   });
 
-  it('ignores an unknown-size binary AFTER download (post-hoc too-large, zero items)', async () => {
+  it('ignores an unknown-size image AFTER download (post-hoc too-large, zero items)', async () => {
     const { source } = makeSource({
-      lists: { root: [pdf('nosize1', 'n.pdf', { size: undefined })] },
-      media: { nosize1: new Uint8Array(MAX_BINARY_BYTES + 1) },
+      lists: { root: [binaryFile('nosize1', 'n.png', 'image/png', { size: undefined })] },
+      media: { nosize1: new Uint8Array(30 * MiB) },
     });
     const { session } = makeSession();
 
@@ -301,6 +303,79 @@ describe('backfill', () => {
     // The download DID happen (size was unknown pre-fetch) but the bytes
     // are discarded — no item, no DocumentInput.
     expect(batches.flatMap((b) => b.items)).toEqual([]);
+  });
+
+  it('a 60 MiB PDF is a metadata-only deferred item with no media download', async () => {
+    const { source, calls } = makeSource({
+      startPageToken: 'spt-1',
+      lists: { root: [pdf('big', 'big.pdf', { size: String(60 * MiB) })] },
+    });
+    const { session } = makeSession();
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => [i.file.id, i.extractionStatus, i.markdown])).toEqual([['big', 'deferred', '']]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+    expect((source.toDocument(items[0]) as DocumentInput).metadata).toMatchObject({
+      mime: 'application/pdf',
+      filename: 'big.pdf',
+      sizeBytes: 60 * MiB,
+    });
+  });
+
+  it('a PDF over MAX_FETCH_BYTES is a "none" item', async () => {
+    const { source } = makeSource({
+      startPageToken: 'spt-1',
+      lists: { root: [pdf('huge', 'huge.pdf', { size: String(MAX_FETCH_BYTES + 1) })] },
+    });
+    const { session } = makeSession();
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => i.extractionStatus)).toEqual(['none']);
+  });
+
+  it('unknown size, 40 MiB after download → deferred item without bytes', async () => {
+    const { source } = makeSource({
+      startPageToken: 'spt-1',
+      lists: { root: [pdf('ns', 'ns.pdf', { size: undefined })] },
+      media: { ns: new Uint8Array(40 * MiB) },
+    });
+    const { session } = makeSession();
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => [i.extractionStatus, i.bytes])).toEqual([['deferred', undefined]]);
+    expect((source.toDocument(items[0]) as DocumentInput).metadata).toMatchObject({
+      size_bytes: 40 * MiB,
+      sizeBytes: 40 * MiB,
+    });
+  });
+
+  it('a size-less file measured earlier as none is NOT re-downloaded on an unchanged re-listing', async () => {
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const query = fakeQuery([
+      fakeDoc('nd', 'file', { md5_checksum: 'md5-nd-1', extraction_status: 'none', size_bytes: 30 * MiB }),
+    ]);
+    const { source, calls } = makeSource(
+      { startPageToken: 'spt-1', lists: { root: [binaryFile('nd', 'n.docx', DOCX, { size: undefined })] } },
+      query,
+    );
+    const { session } = makeSession();
+    expect(((await collect(source.pull(session, null))) as B[]).flatMap(ids)).toEqual([]);
+    expect(calls.some((u) => u.includes('alt=media'))).toBe(false);
+  });
+
+  it('hash-skip pins an unchanged deferred row and re-fetches when the route changed', async () => {
+    const query = fakeQuery([
+      fakeDoc('big', 'file', { md5_checksum: 'md5-big-1', extraction_status: 'deferred' }),
+      fakeDoc('was', 'file', { md5_checksum: 'md5-was-1', extraction_status: 'deferred' }),
+    ]);
+    const { source } = makeSource(
+      {
+        startPageToken: 'spt-1',
+        lists: { root: [pdf('big', 'big.pdf', { size: String(60 * MiB) }), pdf('was', 'was.pdf')] },
+        media: { was: new Uint8Array([1]) },
+      },
+      query,
+    );
+    const { session } = makeSession();
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => [i.file.id, i.extractionStatus])).toEqual([['was', 'ok']]);
   });
 
   it('one unreadable file is warn-skipped and the walk continues', async () => {

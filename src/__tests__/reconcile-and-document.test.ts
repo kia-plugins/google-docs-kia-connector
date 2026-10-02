@@ -8,7 +8,7 @@ import {
   type DriveItem,
 } from '../source';
 import { DriveApiError } from '../client';
-import type { DocumentInput } from '@kiagent/connector-sdk';
+import { MAX_FETCH_BYTES, type DocumentInput } from '@kiagent/connector-sdk';
 import {
   binaryFile,
   collect,
@@ -360,7 +360,33 @@ describe('fetchBytes', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('returns null over the 25 MiB cap without fetching', async () => {
+  it('reconcile keeps deferred and none files in the live set; an oversized image is omitted', async () => {
+    const { source } = makeSource({
+      lists: {
+        root: [
+          pdf('big', 'big.pdf', { size: String(60 * 1024 * 1024) }),
+          pdf('huge', 'huge.pdf', { size: String(MAX_FETCH_BYTES + 1) }),
+          binaryFile('img', 'big.png', 'image/png', { size: String(30 * 1024 * 1024) }),
+        ],
+      },
+    });
+    const { session } = makeSession();
+    const refs = (await collect(source.reconcile!(session))).flat();
+    expect(refs.map((r) => r.externalId).sort()).toEqual(['big', 'huge']);
+  });
+
+  it('fetchBytes serves deferred and refuses none before any request', async () => {
+    const { source, calls } = makeSource({ media: { big: new Uint8Array([7]) } });
+    const { session } = makeSession();
+    const doc = (id: string, size: number) =>
+      fakeDoc(id, 'file', { drive_file_id: id, mime_type: 'application/pdf', size_bytes: size }, { title: `${id}.pdf` });
+    expect(await source.fetchBytes!(session, doc('big', 60 * 1024 * 1024))).toEqual(new Uint8Array([7]));
+    const before = calls.length;
+    expect(await source.fetchBytes!(session, doc('huge', MAX_FETCH_BYTES + 1))).toBeNull();
+    expect(calls.length).toBe(before);
+  });
+
+  it('returns null over the fetch cap without fetching', async () => {
     const { source, calls } = makeSource({});
     const { session } = makeSession();
 
@@ -369,7 +395,7 @@ describe('fetchBytes', () => {
       fakeDoc('big1', 'file', {
         drive_file_id: 'big1',
         mime_type: 'application/pdf',
-        size_bytes: MAX_BINARY_BYTES + 1,
+        size_bytes: MAX_FETCH_BYTES + 1,
       }),
     );
     expect(bytes).toBeNull();

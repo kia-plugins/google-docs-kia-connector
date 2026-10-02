@@ -17,9 +17,10 @@
  *     module doc for the full branch-by-branch rationale. Under
  *     `'cloud-drive'` it ignores archives (any size), all audio/video
  *     (`reason: 'cloud-media'`, regardless of size), and anything outside
- *     the PDF/Office/text/image allowlist, and caps converter/PDF binaries
- *     at `MAX_CLOUD_BINARY_BYTES` (25 MiB) and images at
- *     `MAX_CLOUD_IMAGE_BYTES` (20 MiB) — both inclusive at the boundary.
+ *     the PDF/Office/text/image allowlist. Documents over the eager cap
+ *     (`MAX_CLOUD_BINARY_BYTES`, 25 MiB) keep a metadata-only row (`bytes`:
+ *     `'deferred'` — core's convert worker fetches it later — or `'none'`);
+ *     images over `MAX_CLOUD_IMAGE_BYTES` (20 MiB) are ignored.
  *     NEVER download bytes for a route whose `kind` is `'ignore'`.
  *
  *  3. Google-native precedence stays first and outside the SDK policy: the
@@ -37,7 +38,7 @@ export const EXPORT_FALLBACK_MIME = 'text/plain';
 
 export type DriveRoute =
   | { kind: 'native' }
-  | { kind: 'binary'; pipeline: 'converter' | 'vision' }
+  | { kind: 'binary'; pipeline: 'converter' | 'vision'; bytes: 'eager' | 'deferred' | 'none' }
   | { kind: 'ignore'; reason: FileIgnoreReason };
 
 /**
@@ -64,5 +65,10 @@ export function chooseRoute(
   });
   return d.kind === 'ignore'
     ? d
-    : { kind: 'binary', pipeline: d.pipeline === 'vision' ? 'vision' : 'converter' };
+    : { kind: 'binary', pipeline: d.pipeline === 'vision' ? 'vision' : 'converter', bytes: d.bytes };
+}
+
+/** The `extraction_status` a row built from this route carries. */
+export function statusFor(route: Extract<DriveRoute, { kind: 'binary' }>): 'ok' | 'deferred' | 'none' {
+  return route.bytes === 'eager' ? 'ok' : route.bytes;
 }
