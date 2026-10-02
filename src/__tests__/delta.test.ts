@@ -11,7 +11,7 @@ import {
   type DriveItem,
 } from '../source';
 import { GoogleDocsAuthError } from '../client';
-import type { Batch } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, type Batch } from '@kiagent/connector-sdk';
 import {
   binaryFile,
   collect,
@@ -30,7 +30,7 @@ import {
 
 type B = Batch<DriveCursor, DriveItem>;
 
-const LIVE = { page_token: 'pt-1', backfill_done: true, scope_roots: ['root'] };
+const LIVE = { page_token: 'pt-1', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION };
 
 function makeSource(world: Parameters<typeof driveFetch>[0], query = fakeQuery()) {
   const { fetchFn, calls } = driveFetch(world);
@@ -58,7 +58,7 @@ describe('delta', () => {
     expect(batches[0].items.map((i) => i.file.id)).toEqual(['docA']);
     expect(batches[0].items[0].markdown).toBe('# Doc A v2');
     expect(batches[0].deletions).toEqual([]);
-    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
+    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION });
     // My Drive root resolved once for the scope walk ('root' is an alias).
     expect(calls.filter((u) => u.includes('/files/root'))).toHaveLength(1);
   });
@@ -364,7 +364,7 @@ describe('delta', () => {
 
     expect(batches[0].items.map((i) => i.file.id)).toEqual(['good1']);
     expect(logs.some((l) => l.level === 'warn' && /file bad1 skipped/.test(l.msg))).toBe(true);
-    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'] });
+    expect(batches[0].cursor).toEqual({ page_token: 'nspt-2', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION });
   });
 
   it('commits per page: crash between pages resumes at nextPageToken', async () => {
@@ -386,8 +386,8 @@ describe('delta', () => {
     const batches = (await collect(source.pull(session, LIVE))) as B[];
 
     expect(batches).toHaveLength(2);
-    expect(batches[0].cursor).toEqual({ page_token: 'pt-2', backfill_done: true, scope_roots: ['root'] });
-    expect(batches[1].cursor).toEqual({ page_token: 'nspt-9', backfill_done: true, scope_roots: ['root'] });
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-2', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION });
+    expect(batches[1].cursor).toEqual({ page_token: 'nspt-9', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION });
   });
 
   it('dedupes a page by fileId keeping the LAST change', async () => {
@@ -420,11 +420,11 @@ describe('delta', () => {
     const { session, logs } = makeSession();
 
     const batches = (await collect(
-      source.pull(session, { page_token: 'pt-bad', backfill_done: true, scope_roots: ['root'] }),
+      source.pull(session, { page_token: 'pt-bad', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION }),
     )) as B[];
 
     expect(batches).toEqual([
-      { phase: 'live', items: [], cursor: { page_token: '', backfill_done: false, scope_roots: ['root'] } },
+      { phase: 'live', items: [], cursor: { page_token: '', backfill_done: false, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION } },
     ]);
     expect(logs.some((l) => l.level === 'warn' && /page token rejected/.test(l.msg))).toBe(true);
   });
@@ -442,7 +442,7 @@ describe('delta', () => {
     const { session } = makeSession();
 
     await expect(
-      collect(source.pull(session, { page_token: 'pt-40404', backfill_done: true, scope_roots: ['root'] })),
+      collect(source.pull(session, { page_token: 'pt-40404', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION })),
     ).rejects.toThrow(/drive 500/);
   });
 

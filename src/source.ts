@@ -42,7 +42,7 @@ import type {
   Session,
   Source,
 } from '@kiagent/connector-sdk';
-import { MAX_CLOUD_BINARY_BYTES } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, MAX_CLOUD_BINARY_BYTES } from '@kiagent/connector-sdk';
 import {
   DriveApiError,
   DriveClient,
@@ -110,6 +110,10 @@ export interface DriveCursor {
    *  core, so a pre-existing cursor arrives without it — and `pull()` treats
    *  absent as a mismatch, i.e. exactly one forced backfill per account. */
   scope_roots?: string[];
+  /** `FILE_POLICY_VERSION` this coverage was walked under; ABSENT = 1. A
+   *  stale value forces one re-walk, exactly like a scope_roots mismatch.
+   *  Stamped by `withScopeRoots`; `manageFolders` only carries it. */
+  policy_version?: number;
 }
 
 export interface DriveFile {
@@ -433,14 +437,18 @@ export function sameRootSet(a: string[] | undefined, b: string[]): boolean {
  * infinite re-walk: the next tick reads `undefined`, mismatches, and
  * backfills again. Funnelling every yield through one wrapper makes that
  * unmissable, and keeps a future seventh site correct by construction. Do
- * NOT also edit the six literals — one owner only.
+ * NOT also edit the six literals — one owner only. It also stamps
+ * `policy_version`: one owner for both (`manageFolders` only carries it).
  */
 async function* withScopeRoots(
   batches: AsyncGenerator<Batch<DriveCursor, DriveItem>>,
   scopeRoots: string[],
 ): AsyncGenerator<Batch<DriveCursor, DriveItem>> {
   for await (const batch of batches) {
-    yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots } };
+    yield {
+      ...batch,
+      cursor: { ...batch.cursor, scope_roots: scopeRoots, policy_version: FILE_POLICY_VERSION },
+    };
   }
 }
 
@@ -1433,7 +1441,15 @@ export function createGoogleDocsSource(
       //   "A non-empty saved page_token predates the interrupted walk — a
       //    superset of the changes we might miss — so KEEP it; never
       //    recapture mid-backfill."   (source.ts:634-635)
-      if (!cursor || !cursor.backfill_done || !sameRootSet(cursor.scope_roots, scopeRoots)) {
+      // A stale policy_version re-walks the same way: the file policy now
+      // admits files the previous walk ignored. Deletions stay reconcile()'s.
+      const stalePolicy = (cursor?.policy_version ?? 1) < FILE_POLICY_VERSION;
+      if (
+        !cursor ||
+        !cursor.backfill_done ||
+        stalePolicy ||
+        !sameRootSet(cursor.scope_roots, scopeRoots)
+      ) {
         yield* withScopeRoots(
           backfill(client, session, host.query, cursor, roots, budget),
           scopeRoots,
@@ -1558,6 +1574,11 @@ export function createGoogleDocsSource(
             page_token: prior.page_token,
             backfill_done: rewalk ? false : prior.backfill_done,
             scope_roots: scopeRoots,
+            // CARRIED, never stamped: stamping would skip the one-time
+            // re-walk for roots retained by this save.
+            ...(prior.policy_version !== undefined
+              ? { policy_version: prior.policy_version }
+              : {}),
           }
         : null;
 

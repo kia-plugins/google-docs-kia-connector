@@ -11,7 +11,7 @@ import {
   type DriveItem,
 } from '../source';
 import { GoogleDocsAuthError } from '../client';
-import { MAX_FETCH_BYTES, type Batch, type DocumentInput } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, MAX_FETCH_BYTES, type Batch, type DocumentInput } from '@kiagent/connector-sdk';
 
 const MiB = 1024 * 1024;
 import {
@@ -62,12 +62,12 @@ describe('backfill', () => {
     expect(calls[0]).toContain('/changes/startPageToken');
     // Cursor unchanged all walk long; only the final batch flips.
     for (const b of batches.slice(0, 3)) {
-      expect(b.cursor).toEqual({ page_token: 'spt-1', backfill_done: false, scope_roots: ['root'] });
+      expect(b.cursor).toEqual({ page_token: 'spt-1', backfill_done: false, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION });
     }
     expect(batches[3]).toEqual({
       phase: 'live',
       items: [],
-      cursor: { page_token: 'spt-1', backfill_done: true, scope_roots: ['root'] },
+      cursor: { page_token: 'spt-1', backfill_done: true, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION },
     });
     // Page-aligned batches in BFS order: root p0, root p1, then Sub.
     expect(ids(batches[0])).toEqual(['docA']);
@@ -425,11 +425,12 @@ describe('backfill', () => {
     )) as B[];
 
     expect(calls.some((u) => u.includes('startPageToken'))).toBe(false);
-    expect(batches[0].cursor).toEqual({ page_token: 'pt-keep', backfill_done: false, scope_roots: ['root'] });
+    expect(batches[0].cursor).toEqual({ page_token: 'pt-keep', backfill_done: false, scope_roots: ['root'], policy_version: FILE_POLICY_VERSION });
     expect(batches[batches.length - 1].cursor).toEqual({
       page_token: 'pt-keep',
       backfill_done: true,
       scope_roots: ['root'],
+      policy_version: FILE_POLICY_VERSION,
     });
   });
 
@@ -449,6 +450,7 @@ describe('backfill', () => {
       page_token: 'spt-fresh',
       backfill_done: true,
       scope_roots: ['root'],
+      policy_version: FILE_POLICY_VERSION,
     });
   });
 
@@ -488,7 +490,7 @@ describe('backfill', () => {
     expect(batches[batches.length - 1]).toEqual({
       phase: 'live',
       items: [],
-      cursor: { page_token: 'spt-1', backfill_done: true, scope_roots: ['FA', 'FB'] },
+      cursor: { page_token: 'spt-1', backfill_done: true, scope_roots: ['FA', 'FB'], policy_version: FILE_POLICY_VERSION },
     });
   });
 

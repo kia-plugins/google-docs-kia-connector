@@ -6,7 +6,7 @@
  * verification, no picker).
  */
 import { createGoogleDocsSource, DRIVE_SCOPES, type DriveCursor, type DriveItem } from '../source';
-import type { Batch, FolderNode } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, type Batch, type FolderNode } from '@kiagent/connector-sdk';
 import {
   binaryFile,
   collect,
@@ -20,6 +20,7 @@ import {
   makeFolderChannel,
   makeHost,
   makeSession,
+  pdf,
 } from '../testing/harness';
 
 type B = Batch<DriveCursor, DriveItem>;
@@ -54,10 +55,10 @@ describe('scope_roots rides every cursor write site', () => {
 
     expect(batches.map((b) => b.phase)).toEqual(['backfill', 'backfill', 'backfill', 'live']);
     expect(batches.map((b) => b.cursor)).toEqual([
-      { page_token: 'spt-1', backfill_done: false, scope_roots: ['FA'] },
-      { page_token: 'spt-1', backfill_done: false, scope_roots: ['FA'] },
-      { page_token: 'spt-1', backfill_done: false, scope_roots: ['FA'] },
-      { page_token: 'spt-1', backfill_done: true, scope_roots: ['FA'] },
+      { page_token: 'spt-1', backfill_done: false, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
+      { page_token: 'spt-1', backfill_done: false, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
+      { page_token: 'spt-1', backfill_done: false, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
+      { page_token: 'spt-1', backfill_done: true, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
     ]);
   });
 
@@ -81,15 +82,15 @@ describe('scope_roots rides every cursor write site', () => {
     const { session } = makeSession({ config: ALPHA });
 
     const batches = (await collect(
-      source.pull(session, { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'] }),
+      source.pull(session, { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION }),
     )) as B[];
 
     // No 'root' alias among the roots → no files/root resolution.
     expect(calls.some((u) => u.includes('/files/root'))).toBe(false);
     expect(batches.map((b) => b.cursor)).toEqual([
-      { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'] },
-      { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'] },
-      { page_token: 'nspt-2', backfill_done: true, scope_roots: ['FA'] },
+      { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
+      { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
+      { page_token: 'nspt-2', backfill_done: true, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
     ]);
   });
 
@@ -99,14 +100,14 @@ describe('scope_roots rides every cursor write site', () => {
     const { session } = makeSession({ config: ALPHA });
 
     const batches = (await collect(
-      source.pull(session, { page_token: 'pt-bad', backfill_done: true, scope_roots: ['FA'] }),
+      source.pull(session, { page_token: 'pt-bad', backfill_done: true, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION }),
     )) as B[];
 
     expect(batches).toEqual([
       {
         phase: 'live',
         items: [],
-        cursor: { page_token: '', backfill_done: false, scope_roots: ['FA'] },
+        cursor: { page_token: '', backfill_done: false, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION },
       },
     ]);
   });
@@ -131,7 +132,7 @@ describe('pull() scope_roots mismatch check', () => {
     const { session } = makeSession({ config: TWO });
 
     const batches = (await collect(
-      source.pull(session, { page_token: 'pt-1', backfill_done: true, scope_roots: ['FB', 'FA'] }),
+      source.pull(session, { page_token: 'pt-1', backfill_done: true, scope_roots: ['FB', 'FA'], policy_version: FILE_POLICY_VERSION }),
     )) as B[];
 
     expect(batches.map((b) => b.phase)).toEqual(['live']);
@@ -144,7 +145,7 @@ describe('pull() scope_roots mismatch check', () => {
     const { session } = makeSession({ config: TWO });
 
     const batches = (await collect(
-      source.pull(session, { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'] }),
+      source.pull(session, { page_token: 'pt-1', backfill_done: true, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION }),
     )) as B[];
 
     expect(batches.map((b) => b.phase)).toEqual(['backfill', 'backfill', 'live']);
@@ -154,6 +155,7 @@ describe('pull() scope_roots mismatch check', () => {
       page_token: 'pt-1',
       backfill_done: true,
       scope_roots: ['FA', 'FB'],
+      policy_version: FILE_POLICY_VERSION,
     });
   });
 
@@ -178,6 +180,7 @@ describe('pull() scope_roots mismatch check', () => {
       page_token: 'pt-1',
       backfill_done: true,
       scope_roots: ['FA', 'FB'],
+      policy_version: FILE_POLICY_VERSION,
     });
 
     // Feeding that cursor straight back takes the DELTA branch — proof the
@@ -188,6 +191,79 @@ describe('pull() scope_roots mismatch check', () => {
 
     expect(two.map((b) => b.phase)).toEqual(['live']);
     expect(second.calls.some((u) => u.includes('startPageToken'))).toBe(false);
+  });
+});
+
+describe('pull() policy_version re-walk', () => {
+  it('a live cursor without policy_version re-walks once, keeping its page_token', async () => {
+    const { fetchFn, calls } = driveFetch({
+      lists: { FA: [pdf('big', 'big.pdf', { size: String(60 * 1024 * 1024) })] },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({ config: ALPHA });
+    const old: DriveCursor = { page_token: 'PT-7', backfill_done: true, scope_roots: ['FA'] };
+    const batches = (await collect(source.pull(session, old))) as B[];
+    expect(batches.flatMap((b) => b.items.map((i) => i.file.id))).toEqual(['big']);
+    expect(calls.some((u) => u.includes('/changes/startPageToken'))).toBe(false);
+    expect(batches.at(-1)!.cursor).toEqual({
+      page_token: 'PT-7',
+      backfill_done: true,
+      scope_roots: ['FA'],
+      policy_version: FILE_POLICY_VERSION,
+    });
+  });
+
+  it('a current cursor goes straight to delta', async () => {
+    const { fetchFn, calls } = driveFetch({
+      changes: { 'PT-7': { changes: [], newStartPageToken: 'PT-8' } },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const { session } = makeSession({ config: ALPHA });
+    const batches = (await collect(
+      source.pull(session, {
+        page_token: 'PT-7',
+        backfill_done: true,
+        scope_roots: ['FA'],
+        policy_version: FILE_POLICY_VERSION,
+      }),
+    )) as B[];
+    expect(batches.map((b) => b.phase)).toEqual(['live']);
+    expect(calls.some((u) => u.includes('/drive/v3/files?'))).toBe(false);
+  });
+
+  it('a Manage-folders save carries policy_version; the next pull goes straight to delta', async () => {
+    const { fetchFn } = driveFetch({
+      rootId: 'MYDRIVE',
+      gets: {
+        FOLD1: folder('FOLD1', 'Projects', { parents: ['MYDRIVE'] }),
+        MYDRIVE: folder('MYDRIVE', 'My Drive', { parents: [] }),
+      },
+      lists: { FOLD1: [] },
+      changes: { 'pt-keep': { changes: [], newStartPageToken: 'pt-2' } },
+    });
+    const source = createGoogleDocsSource(makeHost(fetchFn), instantClock);
+    const config = { folderRoots: [{ id: 'FOLD1', name: 'Projects' }] };
+    const { session } = makeSession({
+      config,
+      cursor: {
+        page_token: 'pt-keep',
+        backfill_done: true,
+        scope_roots: ['FOLD1'],
+        policy_version: FILE_POLICY_VERSION,
+      },
+    });
+    const { channel } = makeFolderChannel({
+      picked: [{ id: 'FOLD1', name: 'Projects', hasChildren: true }],
+    });
+    const update = await source.manageFolders!(session, channel);
+    expect(update.cursor).toEqual({
+      page_token: 'pt-keep',
+      backfill_done: true,
+      scope_roots: ['FOLD1'],
+      policy_version: FILE_POLICY_VERSION,
+    });
+    const next = (await collect(source.pull(session, update.cursor as DriveCursor))) as B[];
+    expect(next.map((b) => b.phase)).toEqual(['live']);
   });
 });
 
