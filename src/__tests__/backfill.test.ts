@@ -378,6 +378,17 @@ describe('backfill', () => {
     expect(items.map((i) => [i.file.id, i.extractionStatus])).toEqual([['was', 'ok']]);
   });
 
+  it('a .msg reported as octet-stream downloads and emits binary', async () => {
+    const { source } = makeSource({
+      startPageToken: 'spt-1',
+      lists: { root: [binaryFile('m1', 'Fwd.msg', 'application/octet-stream')] },
+      media: { m1: new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]) },
+    });
+    const { session } = makeSession();
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => [i.file.id, i.extractionStatus])).toEqual([['m1', 'ok']]);
+  });
+
   it('one unreadable file is warn-skipped and the walk continues', async () => {
     const { source } = makeSource({
       lists: { root: [pdf('bad1', 'bad.pdf'), gdoc('docA', 'Doc A')], S: [] },
